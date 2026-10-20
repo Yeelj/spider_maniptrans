@@ -125,6 +125,37 @@ ______________________________________________________________________
         └── program
     ```
 
+### `TACO` dataset
+1. Download TACO V1 and place the required annotations and object models under `data/TACO`:
+    ```
+    data/TACO
+    ├── Hand_Poses
+    ├── Object_Poses
+    └── object_models_released
+    ```
+    RGB and depth videos are not required by ManipTrans.
+
+2. Prepare meter-scale meshes, CoACD collision meshes, and URDFs. To process all used objects:
+    ```bash
+    python scripts/preprocess_taco_assets.py --data-dir data/TACO
+    ```
+    To prepare only one sequence's tool and target:
+    ```bash
+    python scripts/preprocess_taco_assets.py --data-dir data/TACO --sequence-id bb_bowl_0919036
+    ```
+    The generated assets reuse the OakInk-v2 URDF template and are stored as:
+    ```
+    data/TACO/object_models/024/024.ply
+    data/TACO/coacd_object_models/024/024.ply
+    data/TACO/coacd_object_models/024/024.urdf
+    ```
+
+3. TACO uses a compact, globally unique sequence ID:
+    ```
+    (brush, brush, bowl)/20230919_036 -> bb_bowl_0919036
+    ```
+    The first two characters are the action and tool initials, followed by the target name and `MMDD + sequence number`.
+
 ### MISC
 1. Download MANO model files from the [official website](https://mano.is.tue.mpg.de/) and extract them into the `data/mano_v1_2` directory.
 2. Download the SMPL-X model files from the [official website](https://smpl-x.is.tue.mpg.de/) and extract them into the `data/body_utils/body_models` directory.
@@ -260,6 +291,59 @@ ______________________________________________________________________
     python main/rl/train.py task=ResDexHand dexhand=inspire side=BiH headless=true num_envs=4096 learning_rate=2e-4 test=false randomStateInit=true dataIndices=[20aed@0] rh_base_model_checkpoint=assets/imitator_rh_inspire.pth lh_base_model_checkpoint=assets/imitator_lh_inspire.pth early_stop_epochs=1000 actionsMovingAverage=0.4 experiment=cross_20aed@0_inspire
     ```
     Similar to single-hand training, the `early_stop_epochs` parameter can be adjusted based on the task complexity.
+
+#### OakInk-V2 tool replacement
+
+For OakInk-V2, `new_obj=<native_object_id>` replaces the right-hand tool in both
+training and testing (`side=BiH` or `side=RH`). For example:
+
+```bash
+# Train with a replacement tool (retarget both hands as above first).
+python main/rl/train.py task=ResDexHand dexhand=inspire side=BiH headless=true num_envs=4096 test=false 'dataIndices=[20aed@0]' 'new_obj=O02@0015@00004' learning_rate=2e-4 early_stop_epochs=1000 actionsMovingAverage=0.4 experiment=cross_20aed_obj00004_inspire
+
+# Test the trained policy with the same replacement tool.
+python main/rl/train.py task=ResDexHand dexhand=inspire side=BiH headless=false num_envs=4 test=true randomStateInit=false 'dataIndices=[20aed@0]' 'new_obj=O02@0015@00004' actionsMovingAverage=0.4 'checkpoint=runs/<experiment>/nn/<checkpoint>.pth'
+```
+
+The replacement must have one `.obj` or `.ply` mesh under
+`data/OakInk-v2/object_preview/align_ds/<native_object_id>/`, plus the same-named
+CoACD mesh and corresponding `.urdf` under
+`data/OakInk-v2/coacd_object_preview/align_ds/<native_object_id>/` (see the
+OakInk-V2 prerequisites). The replacement need not be present in the sequence's
+annotations. Missing or ambiguous assets raise an error before data loading.
+
+Both hand trajectories, both object trajectories, the original retargeting PKLs,
+and the left-hand object are retained. The replacement's mesh, sampled shape,
+reference fingertip distances, and simulation asset use the new geometry; the
+simulator uses its existing `oakink2_obj_scale` and `oakink2_obj_mass` entries
+when available. The replacement uses the original object's local coordinate
+frame without automatic alignment or size matching. Omit `new_obj` (or use
+`new_obj=null`) to retain the original behavior. An override requires all
+`dataIndices` to belong to the same dataset; `side=LH` does not support this
+right-hand override.
+
+#### TACO example
+
+TACO is recorded at 30 FPS and is interpolated to ManipTrans's 60 FPS internally. Retarget both hands first:
+```bash
+python main/dataset/mano2dexhand.py --data_idx bb_bowl_0919036 --side right --dexhand inspire --headless --iter 7000
+python main/dataset/mano2dexhand.py --data_idx bb_bowl_0919036 --side left --dexhand inspire --headless --iter 7000
+```
+
+Then train a united bimanual policy:
+```bash
+python main/rl/train.py task=ResDexHand dexhand=inspire side=BiH bimanual_mode=united headless=true num_envs=4096 learning_rate=2e-4 test=false randomStateInit=true dataIndices=[bb_bowl_0919036] rh_base_model_checkpoint=assets/imitator_rh_inspire.pth lh_base_model_checkpoint=assets/imitator_lh_inspire.pth early_stop_epochs=1000 actionsMovingAverage=0.4 experiment=cross_bb_bowl_0919036_inspire
+```
+
+To replace only the right-hand TACO tool mesh while keeping both hand trajectories,
+both object trajectories, and the left-hand target unchanged, prepare the replacement
+object and add `new_obj=<object_id>` to both training and testing commands:
+```bash
+python scripts/preprocess_taco_assets.py --data-dir data/TACO --object-id 006
+python main/rl/train.py task=ResDexHand dexhand=inspire side=BiH bimanual_mode=united headless=true num_envs=4096 learning_rate=2e-4 test=false randomStateInit=true dataIndices=[bb_bowl_0919036] new_obj=006 rh_base_model_checkpoint=assets/imitator_rh_inspire.pth lh_base_model_checkpoint=assets/imitator_lh_inspire.pth early_stop_epochs=1000 actionsMovingAverage=0.4 experiment=cross_bb_bowl_0919036_obj006_inspire
+```
+The replacement keeps the original tool trajectory and local object frame; it does
+not automatically align or scale the new geometry to the original tool.
 
 3. **Test**
   Test the bi-manual policy:

@@ -8,7 +8,6 @@ from time import time
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 from ...utils import torch_jit_utils as torch_jit_utils
 from bps_torch.bps import bps_torch
 from gym import spaces
@@ -33,7 +32,7 @@ from ..core.config import ROBOT_HEIGHT, config
 from ...envs.core.sim_config import sim_config
 from ...envs.core.vec_task import VecTask
 from ...utils.pose_utils import get_mat
-
+import torch
 
 def soft_clamp(x, lower, upper):
     return lower + torch.sigmoid(4 / (upper - lower) * (x - (lower + upper) / 2)) * (upper - lower)
@@ -61,6 +60,9 @@ class DexHandManipBiHEnv(VecTask):
         # self.dexhand_rh_dof_noise = self.cfg["env"]["dexhand_rDofNoise"]
         self.aggregate_mode = self.cfg["env"]["aggregateMode"]
         self.training = self.cfg["env"]["training"]
+        self.semantic_contact_eval = None
+        self.semantic_contact_detector = None
+        self._semantic_contact_snapshot = None
         self.dexhand_rh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
 
@@ -96,6 +98,7 @@ class DexHandManipBiHEnv(VecTask):
         self.actions = None  # Current actions to be deployed
 
         self.dataIndices = self.cfg["env"]["dataIndices"]
+        self.new_obj = self.cfg["env"].get("new_obj", None)
         # self.dataIndices = [tuple([int(i) for i in idx.split("@")]) for idx in self.dataIndices]
         self.obs_future_length = self.cfg["env"]["obsFutureLength"]
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
@@ -199,11 +202,83 @@ class DexHandManipBiHEnv(VecTask):
         obj_verts_lh = self.demo_data_lh["obj_verts"]
         self.obj_bps_lh = self.bps_layer.encode(obj_verts_lh, feature_type=self.bps_feat_type)[self.bps_feat_type]
 
+        self._init_semantic_contact_eval()
+
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
 
         # Refresh tensors
         self._refresh()
+
+    def _init_semantic_contact_eval(self):
+        eval_cfg = self.cfg["env"].get("semanticContactEval", {})
+        if self.training or not eval_cfg.get("enabled", False):
+            return
+        from main.semantic_contact_eval import (
+            CollisionSurfaceProxy, SemanticContactAccumulator, SemanticContactEvalConfig,
+            full_fragment_end, load_semantic_regions,
+            load_contact_required_masks, canonical_contact_metadata_path,
+        )
+        from main.semantic_contact_geometry import URDFCollisionKinematics
+        from pathlib import Path
+
+        config = SemanticContactEvalConfig.from_mapping(eval_cfg)
+        # Include every collision link, even those omitted by policy body_names.
+        geometry = URDFCollisionKinematics(
+            Path(self.dexhand_rh.urdf_path), self.dexhand_rh.dof_names, config.pointsPerLink
+        )
+        env = self.envs[0]
+        actor = self.gym.find_actor_handle(env, "dexhand_r")
+        handles = {name: self.gym.find_actor_rigid_body_handle(env, actor, name)
+                   for name in geometry.point_link_names}
+        missing = [name for name, handle in handles.items() if handle < 0]
+        if missing:
+            raise ValueError(f"Semantic evaluation collision links missing from simulator: {missing}")
+        indices = [handles[geometry.point_link_names[i]] for i in geometry.point_link_ids_array]
+        overrides = eval_cfg.get("semanticMeshPaths", {})
+        region_cache, regions, region_ids, scales = {}, [], [], []
+        for i, env in enumerate(self.envs):
+            data_idx = str(self.dataIndices[i % len(self.dataIndices)])
+            mesh_path = str(Path(overrides.get(data_idx, self.demo_data_rh["obj_mesh_path"][i])).resolve())
+            if mesh_path not in region_cache:
+                try:
+                    regions.append(load_semantic_regions(mesh_path))
+                except (ValueError, OSError) as error:
+                    raise ValueError(
+                        f"semanticContactEval dataIndices={data_idx}: {error}. Supply a labeled mesh "
+                        "of the same tool in meters via semanticMeshPaths; no geometry substitution."
+                    ) from error
+                region_cache[mesh_path] = len(regions) - 1
+            region_ids.append(region_cache[mesh_path])
+            tool_actor = self.gym.find_actor_handle(env, "manip_obj_rh")
+            scales.append(self.gym.get_actor_scale(env, tool_actor))
+        self.semantic_contact_detector = CollisionSurfaceProxy(
+            torch.as_tensor(geometry.local_points, device=self.device, dtype=torch.float32),
+            torch.tensor(indices, device=self.device), regions,
+            torch.tensor(region_ids, device=self.device),
+            torch.tensor(scales, device=self.device), config,
+        )
+        end_frames = full_fragment_end(
+            self.demo_data_rh["seq_len"], self.demo_data_lh["seq_len"], self.max_episode_length
+        )
+        metadata_paths = dict(eval_cfg.get("contactMetadataPaths", {}))
+        if config.contactRequiredMaskFile is None:
+            for data_idx in self.dataIndices:
+                if str(data_idx) not in metadata_paths and self.new_obj is not None:
+                    dataset_type = ManipDataFactory.dataset_type(data_idx)
+                    dataset_name = {"taco": "TACO", "oakink2": "OakInk-v2"}.get(dataset_type)
+                    if dataset_name is not None:
+                        path = canonical_contact_metadata_path(
+                            config.contactRetargetRoot, dataset_name, str(self.dexhand_rh),
+                            str(data_idx), self.new_obj,
+                        )
+                        if path is not None:
+                            metadata_paths[str(data_idx)] = path
+        contact_required, self.semantic_contact_mask_sources = load_contact_required_masks(
+            [str(self.dataIndices[i % len(self.dataIndices)]) for i in range(self.num_envs)],
+            end_frames + 1, self.demo_data_rh.get("tips_distance"), config, metadata_paths,
+        )
+        self.semantic_contact_eval = SemanticContactAccumulator(end_frames, config, contact_required)
 
     def create_sim(self):
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
@@ -256,6 +331,17 @@ class DexHandManipBiHEnv(VecTask):
         self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
         dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+        if self.new_obj is not None:
+            unsupported_datasets = sorted(
+                dataset_type for dataset_type in dataset_list if dataset_type not in ("taco", "oakink2")
+            )
+            if unsupported_datasets:
+                raise ValueError(
+                    "new_obj only supports TACO and OakInk-V2 bimanual data, but received datasets: "
+                    f"{unsupported_datasets}"
+                )
+            if len(dataset_list) > 1:
+                raise ValueError("new_obj requires dataIndices from a single dataset (TACO or OakInk-V2)")
 
         self.demo_dataset_lh_dict = {}
         self.demo_dataset_rh_dict = {}
@@ -270,6 +356,9 @@ class DexHandManipBiHEnv(VecTask):
                 dexhand=self.dexhand_lh,
                 embodiment=self.cfg["env"]["dexhand"],
             )
+            rh_dataset_kwargs = {}
+            if dataset_type in ("taco", "oakink2"):
+                rh_dataset_kwargs["new_obj"] = self.new_obj
             self.demo_dataset_rh_dict[dataset_type] = ManipDataFactory.create_data(
                 manipdata_type=dataset_type,
                 side="right",
@@ -278,6 +367,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_rh,
                 embodiment=self.cfg["env"]["dexhand"],
+                **rh_dataset_kwargs,
             )
 
         dexhand_rh_asset_file = self.dexhand_rh.urdf_path
@@ -967,13 +1057,35 @@ class DexHandManipBiHEnv(VecTask):
         self._update_states()
 
     def compute_reward(self, actions):
-        lh_rew_buf, lh_reset_buf, lh_success_buf, lh_failure_buf, lh_reward_dict, lh_error_buf = (
-            self.compute_reward_side(actions, side="lh")
-        )
-        rh_rew_buf, rh_reset_buf, rh_success_buf, rh_failure_buf, rh_reward_dict, rh_error_buf = (
-            self.compute_reward_side(actions, side="rh")
-        )
+        (
+            lh_rew_buf,
+            lh_reset_buf,
+            lh_success_buf,
+            lh_failure_buf,
+            lh_reward_dict,
+            lh_error_buf,
+            lh_diff_obj_pos,
+            lh_diff_obj_rot,
+            lh_diff_joints,
+            lh_diff_ft,
+        ) = self.compute_reward_side(actions, side="lh")
+        (
+            rh_rew_buf,
+            rh_reset_buf,
+            rh_success_buf,
+            rh_failure_buf,
+            rh_reward_dict,
+            rh_error_buf,
+            rh_diff_obj_pos,
+            rh_diff_obj_rot,
+            rh_diff_joints,
+            rh_diff_ft,
+        ) = self.compute_reward_side(actions, side="rh")
         self.rew_buf = rh_rew_buf + lh_rew_buf
+        self.diff_obj_pos = (rh_diff_obj_pos + lh_diff_obj_pos) / 2
+        self.diff_obj_rot = (rh_diff_obj_rot + lh_diff_obj_rot) / 2
+        self.diff_joints = (rh_diff_joints + lh_diff_joints) / 2
+        self.diff_ft = (rh_diff_ft + lh_diff_ft) / 2
         self.reset_buf = rh_reset_buf | lh_reset_buf
         self.success_buf = rh_success_buf & lh_success_buf
         self.failure_buf = rh_failure_buf | lh_failure_buf
@@ -1086,7 +1198,18 @@ class DexHandManipBiHEnv(VecTask):
         if self.rollout_len is not None:
             max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
 
-        rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf = compute_imitation_reward(
+        (
+            rew_buf,
+            reset_buf,
+            success_buf,
+            failure_buf,
+            reward_dict,
+            error_buf,
+            diff_obj_pos,
+            diff_obj_rot,
+            diff_joints,
+            diff_ft,
+        ) = compute_imitation_reward(
             self.reset_buf,
             self.progress_buf,
             self.running_progress_buf,
@@ -1098,7 +1221,18 @@ class DexHandManipBiHEnv(VecTask):
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
         )
         self.total_rew_buf += rew_buf
-        return rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf
+        return (
+            rew_buf,
+            reset_buf,
+            success_buf,
+            failure_buf,
+            reward_dict,
+            error_buf,
+            diff_obj_pos,
+            diff_obj_rot,
+            diff_joints,
+            diff_ft,
+        )
 
     def compute_observations(self):
         self._refresh()
@@ -1470,6 +1604,10 @@ class DexHandManipBiHEnv(VecTask):
                 self.best_rollout_begin = self.progress_buf[max_running_env_id] - 1 - max_running_steps
 
         self._reset_default(env_ids)
+        if self.semantic_contact_eval is not None:
+            self.semantic_contact_eval.reset(
+                env_ids, self.progress_buf[env_ids], eligible=not self.random_state_init
+            )
 
     def reset_done(self):
         done_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
@@ -1491,6 +1629,14 @@ class DexHandManipBiHEnv(VecTask):
         info["reward_dict"] = self.reward_dict
         info["total_rewards"] = self.total_rew_buf
         info["total_steps"] = self.progress_buf
+        if self.semantic_contact_eval is not None:
+            info["semantic_contact_eval"] = self._semantic_contact_snapshot
+        info["diff_metrics"] = {
+            "diff_obj_pos": self.diff_obj_pos,
+            "diff_obj_rot": self.diff_obj_rot,
+            "diff_joints": self.diff_joints,
+            "diff_ft": self.diff_ft,
+        }
         return obs, rew, done, info
 
     def pre_physics_step(self, actions):
@@ -1760,6 +1906,17 @@ class DexHandManipBiHEnv(VecTask):
         self.compute_observations()
         self.compute_reward(self.actions)
 
+        if self.semantic_contact_eval is not None:
+            red_events, black_events = self.semantic_contact_detector.detect(
+                self._rigid_body_state, self.net_cf, self._manip_obj_rh_root_state,
+                self.semantic_contact_eval.active(self.progress_buf),
+            )
+            self.semantic_contact_eval.record(self.progress_buf, red_events, black_events)
+            # Clone terminal results before progress increments or selective resets.
+            self._semantic_contact_snapshot = self.semantic_contact_eval.finish(
+                self.reset_buf, self.success_buf
+            )
+
         self.progress_buf += 1
         self.running_progress_buf += 1
         self.randomize_buf += 1
@@ -1850,9 +2007,20 @@ def compute_imitation_reward(
     max_length: List[int],
     scale_factor: float,
     dexhand_weight_idx: Dict[str, List[int]],
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> Tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Dict[str, Tensor],
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Tensor, Tensor, Tensor, Tensor]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -1956,6 +2124,19 @@ def compute_imitation_reward(
         | (torch.norm(current_obj_ang_vel, dim=-1) > 200)
     )  # sanity check
 
+    diff_joints = torch.stack([diff_level_1_pos_dist, diff_level_2_pos_dist]).mean(dim=0) * 100.0
+    diff_ft = torch.stack(
+        [
+            diff_thumb_tip_pos_dist,
+            diff_index_tip_pos_dist,
+            diff_middle_tip_pos_dist,
+            diff_pinky_tip_pos_dist,
+            diff_ring_tip_pos_dist,
+        ]
+    ).mean(dim=0) * 100.0
+    diff_obj_pos = diff_obj_pos_dist * 100.0
+    diff_obj_rot = diff_obj_rot_angle.abs() / np.pi * 180
+
     failed_execute = (
         (
             (diff_obj_pos_dist > 0.02 / 0.343 * scale_factor**3)  # TODO
@@ -2025,4 +2206,15 @@ def compute_imitation_reward(
         "reward_finger_tip_force": reward_finger_tip_force,
     }
 
-    return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
+    return (
+        reward_execute,
+        reset_buf,
+        succeeded,
+        failed_execute,
+        reward_dict,
+        error_buf,
+        diff_obj_pos,
+        diff_obj_rot,
+        diff_joints,
+        diff_ft,
+    )

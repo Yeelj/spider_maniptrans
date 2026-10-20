@@ -366,6 +366,7 @@ class MyBasePlayer(object):
         is_deterministic = self.is_deterministic
         sum_rewards = 0
         sum_steps = 0
+        semantic_totals = None
         has_masks = False
         has_masks_func = getattr(self.env, "has_action_mask", None) is not None
 
@@ -495,6 +496,13 @@ class MyBasePlayer(object):
             done_count = len(done_indices)
 
             if done_count > 0:
+                semantic_summary = None
+                snapshot = info.get("semantic_contact_eval")
+                if snapshot is not None:
+                    from main.semantic_contact_eval import SemanticContactSummary
+                    if semantic_totals is None:
+                        semantic_totals = SemanticContactSummary()
+                    semantic_summary = semantic_totals.add(snapshot, done_indices)
                 if self.is_rnn:
                     for s in self.states:
                         s[:, all_done_indices, :] = s[:, all_done_indices, :] * 0.0
@@ -510,7 +518,11 @@ class MyBasePlayer(object):
                 if self.print_stats:
                     cur_rewards_done = cur_rewards / done_count
                     cur_steps_done = cur_steps / done_count
-                    print(f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}")
+                    message = f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}"
+                    if semantic_summary is not None:
+                        from main.semantic_contact_eval import format_semantic_contact_summary
+                        message += " " + format_semantic_contact_summary(semantic_summary)
+                    print(message)
 
     def get_batch_size(self, obses, batch_size):
         obs_shape = self.obs_shape

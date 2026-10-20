@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from isaacgym import gymapi, gymtorch
+from isaacgym.torch_utils import normalize_angle, quat_conjugate, quat_mul
+
 import os
 import random
 from enum import Enum
@@ -8,14 +11,12 @@ from time import time
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 from ...utils import torch_jit_utils as torch_jit_utils
 from bps_torch.bps import bps_torch
 from gym import spaces
-from isaacgym import gymapi, gymtorch
-from isaacgym.torch_utils import normalize_angle, quat_conjugate, quat_mul
 from maniptrans_envs.lib.envs.dexhands.factory import DexHandFactory
 from main.dataset.factory import ManipDataFactory
+import torch
 
 
 from main.dataset.transform import (

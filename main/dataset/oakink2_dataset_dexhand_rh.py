@@ -19,7 +19,7 @@ from typing import List
 from main.dataset.oakink2_layer.smplx import SMPLXLayer
 from main.dataset.transform import aa_to_rotmat, caculate_align_mat, rotmat_to_aa
 from .base import ManipData
-from .oakink2_dataset_utils import load_obj_map, as_mesh
+from .oakink2_dataset_utils import load_obj_map, as_mesh, oakink2_object_paths, oakink2_obj_scale
 from .decorators import register_manipdata
 
 
@@ -35,8 +35,13 @@ class OakInk2DatasetDexHandRH(ManipData):
         mujoco2gym_transf=None,
         max_seq_len=int(1e10),
         dexhand=None,
+        new_obj=None,
         **kwargs,
     ):
+        self.new_obj = None if new_obj is None or new_obj == "" else new_obj
+        self._override_object_paths = (
+            oakink2_object_paths(data_dir, self.new_obj) if self.new_obj is not None else None
+        )
         super().__init__(
             data_dir=data_dir,
             split=split,
@@ -182,10 +187,15 @@ class OakInk2DatasetDexHandRH(ManipData):
             np.repeat(mano_rot_offset[None], smplx_results.transform_abs.shape[0], axis=0), device=self.device
         )
 
-        obj_mesh = load_obj_map(os.path.join(self.data_dir, "object_preview", "align_ds"), object_list)
-        obj_id = program_info_selected["obj_list_rh"][0]
-        obj_mesh_trimesh = obj_mesh[program_info_selected["obj_list_rh"][0]][0]
-        obj_mesh_path = obj_mesh[program_info_selected["obj_list_rh"][0]][1]
+        # Select geometry independently of the annotated object's motion. The
+        # replacement need not occur in this sequence's annotation at all.
+        source_obj_id = program_info_selected["obj_list_rh"][0]
+        obj_id = self.new_obj if self.new_obj is not None else source_obj_id
+        obj_mesh = load_obj_map(
+            os.path.join(self.data_dir, "object_preview", "align_ds"),
+            object_list if self.new_obj is None else [obj_id],
+        )
+        obj_mesh_trimesh, obj_mesh_path = obj_mesh[obj_id]
 
         mesh = Meshes(
             verts=torch.from_numpy(obj_mesh_trimesh.vertices[None, ...].astype(np.float32)),
@@ -193,13 +203,17 @@ class OakInk2DatasetDexHandRH(ManipData):
         )
 
         rs_verts_obj = self.random_sampling_pc(mesh)
+        if self.new_obj is not None:
+            # The simulator applies this scale to the URDF actor. Keep its
+            # shape observations and reference contact distances consistent.
+            rs_verts_obj = rs_verts_obj * oakink2_obj_scale.get(obj_id, 1.0)
 
         data = {
             "data_path": self.data_pathes[idx],
             "obj_id": obj_id,
             "obj_mesh_path": obj_mesh_path,
             "obj_verts": rs_verts_obj,
-            "obj_trajectory": obj_transf_map[obj_id],
+            "obj_trajectory": obj_transf_map[source_obj_id],
             "scene_objs": [],  #! BUG: NO TRANSFER
             "wrist_pos": wrist_pos,
             "wrist_rot": wrist_rot,
@@ -211,6 +225,8 @@ class OakInk2DatasetDexHandRH(ManipData):
         )
         obj_urdf_path_file = obj_mesh_path_file.replace(".obj", ".urdf").replace(".ply", ".urdf")
         data["obj_urdf_path"] = os.path.join(obj_urdf_path_dir, obj_urdf_path_file)
+        if self._override_object_paths is not None:
+            data["obj_urdf_path"] = self._override_object_paths[1]
 
         self.process_data(data, idx, rs_verts_obj)
 

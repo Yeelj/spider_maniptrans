@@ -18,10 +18,33 @@ env:
   randomStateInit: ${resolve_default:True,${...randomStateInit}}
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
+  new_obj: ${...new_obj}
   obsFutureLength: 1
 
   rolloutLen: ${resolve_default:None,${...rolloutLen}}
   rolloutBegin: ${resolve_default:None,${...rolloutBegin}}
+
+  # Independent of policy inputs. Test-only metrics for ResDexHandBiH.
+  semanticContactEval:
+    enabled: false
+    forceThreshold: 1.0
+    contactDistance: 0.01
+    pointsPerLink: 32
+    envChunkSize: 16
+    minRedContactRatio: 0.90
+    maxBlackContactRatio: 0.05
+    maxBlackViolationFrameRatio: 0.05
+    minContactFrames: 3
+    minPlannedSemanticContactCoverage: 0.80
+    expectedContactDistance: 0.03
+    contactRequiredMaskFile: null
+    # Read-only common correction metadata; never changes the policy trajectory.
+    contactRetargetRoot: data/retargeting_contact
+    # Optional dataIndices -> common corrected PKL, overrides canonical lookup.
+    contactMetadataPaths: {}
+    # Optional dataIndices -> labeled mesh path: same physical tool/frame/meters.
+    # Empty uses the loaded right-hand tool's obj_mesh_path (including new_obj).
+    semanticMeshPaths: {}
 
   clipObservations: 5.0
   clipActions: 1.0

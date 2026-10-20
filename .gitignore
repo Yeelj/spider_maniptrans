@@ -184,6 +184,7 @@ select*/*
 tmp*.py
 eval*.py
 test*.py
+!tests/test_semantic_contact_eval.py
 annotator*.py
 make*.py
 

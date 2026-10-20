@@ -29,6 +29,10 @@ actionsMovingAverage: 1.0
 usePIDControl: False
 
 dataIndices: [7]
+# Optional right-hand tool mesh override (TACO BiH; OakInk-V2 BiH/RH).
+# Use a TACO object ID (e.g. 006) or a native OakInk-V2 ID (e.g. O02@0015@00004).
+# The source hand/object trajectories and the left-hand target remain unchanged.
+new_obj: null
 
 # seed - set to -1 to choose random seed
 seed: 42

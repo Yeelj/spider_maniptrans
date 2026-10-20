@@ -336,6 +336,10 @@ class MyA2CBase(BaseAlgorithm):
         self.games_to_track = self.config.get("games_to_track", 100)
         print("current training device:", self.ppo_device)
         self.game_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
+        self.game_diff_obj_pos = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
+        self.game_diff_obj_rot = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
+        self.game_diff_joints = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
+        self.game_diff_ft = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
         self.game_success = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
         self.game_fails = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
         self.game_shaped_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
@@ -589,6 +593,10 @@ class MyA2CBase(BaseAlgorithm):
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)
         self.current_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
+        self.current_diff_obj_pos = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
+        self.current_diff_obj_rot = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
+        self.current_diff_joints = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
+        self.current_diff_ft = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
         self.current_shaped_rewards = torch.zeros(current_rewards_shape, dtype=torch.float32, device=self.ppo_device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.ppo_device)
         self.dones = torch.ones((batch_size,), dtype=torch.uint8, device=self.ppo_device)
@@ -724,6 +732,10 @@ class MyA2CBase(BaseAlgorithm):
     def clear_stats(self):
         batch_size = self.num_agents * self.num_actors
         self.game_rewards.clear()
+        self.game_diff_obj_pos.clear()
+        self.game_diff_obj_rot.clear()
+        self.game_diff_joints.clear()
+        self.game_diff_ft.clear()
         self.game_success.clear()
         self.game_fails.clear()
         self.game_shaped_rewards.clear()
@@ -924,6 +936,10 @@ class MyA2CBase(BaseAlgorithm):
             self.experience_buffer.update_data("rewards", n, shaped_rewards)
 
             self.current_rewards += rewards
+            self.current_diff_obj_pos = infos["diff_metrics"]["diff_obj_pos"][:, None]
+            self.current_diff_obj_rot = infos["diff_metrics"]["diff_obj_rot"][:, None]
+            self.current_diff_joints = infos["diff_metrics"]["diff_joints"][:, None]
+            self.current_diff_ft = infos["diff_metrics"]["diff_ft"][:, None]
             self.current_shaped_rewards += shaped_rewards
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
@@ -943,6 +959,10 @@ class MyA2CBase(BaseAlgorithm):
                         self.current_reward_dict[k] = v.unsqueeze(1)
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
+            self.game_diff_obj_pos.update(self.current_diff_obj_pos[env_done_indices])
+            self.game_diff_obj_rot.update(self.current_diff_obj_rot[env_done_indices])
+            self.game_diff_joints.update(self.current_diff_joints[env_done_indices])
+            self.game_diff_ft.update(self.current_diff_ft[env_done_indices])
             self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
             self.game_success.update(self.vec_env.success_buf[env_done_indices])
             self.game_fails.update(self.vec_env.failure_buf[env_done_indices])
@@ -1385,6 +1405,11 @@ class MyContinuousA2CBase(MyA2CBase):
                     mean_lengths = self.game_lengths.get_mean()
                     self.mean_rewards = mean_rewards[0]
 
+                    mean_diff_obj_pos = self.game_diff_obj_pos.get_mean()
+                    mean_diff_obj_rot = self.game_diff_obj_rot.get_mean()
+                    mean_diff_joints = self.game_diff_joints.get_mean()
+                    mean_diff_ft = self.game_diff_ft.get_mean()
+
                     for i in range(self.value_size):
                         rewards_name = "rewards" if i == 0 else "rewards{0}".format(i)
                         self.writer.add_scalar(rewards_name + "/step".format(i), mean_rewards[i], frame)
@@ -1436,7 +1461,14 @@ class MyContinuousA2CBase(MyA2CBase):
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print("saving next best rewards: ", mean_rewards)
                         self.last_mean_rewards = mean_rewards[0]
-                        self.save(os.path.join(self.nn_dir, self.config["name"]))
+                        ckpt = self.config["name"] + "_ep_" + str(epoch_num) + "_rew_" + str(mean_rewards[0])
+                        ckpt += f"_sr_{mean_success_rate}"
+                        ckpt += f"_fr_{mean_fail_rate}"
+                        ckpt += f"_Er_{mean_diff_obj_rot}"
+                        ckpt += f"_Et_{mean_diff_obj_pos}"
+                        ckpt += f"_Ej_{mean_diff_joints}"
+                        ckpt += f"_Eft_{mean_diff_ft}"
+                        self.save(os.path.join(self.nn_dir, ckpt))
 
                         if "score_to_win" in self.config:
                             if self.last_mean_rewards > self.config["score_to_win"]:

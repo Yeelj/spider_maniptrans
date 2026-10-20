@@ -1,6 +1,33 @@
 import trimesh
 import os
+from pathlib import Path
 from typing import List
+
+
+def oakink2_object_paths(data_dir, object_id: str):
+    """Resolve a native OakInk-V2 mesh and its prepared collision/URDF assets."""
+    if not isinstance(object_id, str) or not object_id or Path(object_id).name != object_id:
+        raise ValueError(f"Expected an OakInk-V2 object ID such as 'O02@0015@00004', got {object_id!r}")
+    if object_id in (".", ".."):
+        raise ValueError(f"Invalid OakInk-V2 object ID: {object_id!r}")
+    data_dir = Path(data_dir)
+    object_dir = data_dir / "object_preview" / "align_ds" / object_id
+    if not object_dir.is_dir():
+        raise FileNotFoundError(f"Missing OakInk-V2 object directory: {object_dir}")
+    meshes = sorted(path for path in object_dir.iterdir() if path.is_file() and path.suffix in (".obj", ".ply"))
+    if len(meshes) != 1:
+        raise ValueError(f"Expected one .obj or .ply mesh in {object_dir}, found {meshes}")
+
+    mesh_path = meshes[0]
+    coacd_path = data_dir / "coacd_object_preview" / "align_ds" / object_id / mesh_path.name
+    urdf_path = coacd_path.with_suffix(".urdf")
+    missing = [str(path) for path in (coacd_path, urdf_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing processed OakInk-V2 assets: {missing}. Prepare the CoACD mesh and matching URDF "
+            "as described in README.md under OakInk-V2 prerequisites."
+        )
+    return str(mesh_path), str(urdf_path)
 
 
 def as_mesh(scene_or_mesh):
