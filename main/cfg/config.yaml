@@ -62,6 +62,9 @@ num_subscenes: 4 # Splits the simulation into N physics scenes and runs each one
 # RLGames Arguments
 # test - if set, run policy in inference mode (requires setting checkpoint to load)
 test: False
+# Optional total number of ended test episodes across all parallel environments.
+# null preserves the original continuous test loop.
+test_episodes: null
 # save rollouts config, used for distillation
 save_rollouts: False
 save_successful_rollouts_only: True

@@ -75,6 +75,10 @@ def launch_rlg_hydra(cfg: DictConfig):
     import os
     from datetime import datetime
 
+    if cfg.test:
+        from lib.utils.episode_statistics import validate_test_episodes
+        validate_test_episodes(cfg.get("test_episodes"))
+
     import isaacgym
     from hydra.utils import to_absolute_path
 
@@ -129,6 +133,9 @@ def launch_rlg_hydra(cfg: DictConfig):
         elif type(cfg.checkpoint) == list:
             cfg.checkpoint = [to_absolute_path(cp) for cp in cfg.checkpoint]
 
+    from lib.utils.spider_reference import prepare_training_config
+    spider_references = prepare_training_config(cfg)
+
     cfg_dict = omegaconf_to_dict(cfg)
     print_dict(cfg_dict)
 
@@ -164,6 +171,7 @@ def launch_rlg_hydra(cfg: DictConfig):
                 envs,
                 n_parallel_recorders=cfg.n_parallel_recorders,
                 n_successful_videos_to_record=cfg.n_successful_videos_to_record,
+                stop_after_videos=not (cfg.test and cfg.get("test_episodes") is not None),
             )
         return envs
 
@@ -227,6 +235,10 @@ def launch_rlg_hydra(cfg: DictConfig):
     os.makedirs(experiment_dir, exist_ok=True)
     with open(os.path.join(experiment_dir, "config.yaml"), "w") as f:
         f.write(OmegaConf.to_yaml(cfg))
+    if spider_references:
+        import json
+        with open(os.path.join(experiment_dir, "spider_references.json"), "w") as f:
+            json.dump(spider_references, f, indent=2, allow_nan=False)
 
     runner.run(
         {
@@ -235,6 +247,10 @@ def launch_rlg_hydra(cfg: DictConfig):
             "checkpoint": cfg.checkpoint,
             "from_ckpt_epoch": cfg.from_ckpt_epoch,
             "sigma": cfg.sigma if cfg.sigma != "" else None,
+            "test_statistics": {
+                "test_episodes": cfg.get("test_episodes") if cfg.test else None,
+                "test_output_dir": experiment_dir if cfg.test else None,
+            },
             "save_rollouts": {
                 "save_rollouts": cfg.save_rollouts,
                 "rollout_saving_fpath": os.path.join(experiment_dir, "rollouts.hdf5"),

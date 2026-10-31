@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wait for a training PID, then run the next training command in tmux.
 
-Defaults: PID 24826, tmux session 0 / window 0 / pane 0.
+Defaults: PID 65892, tmux session 1 / window 0 / pane 0.
 Run this script from another terminal; the tmux pane keeps its working directory
 and activated Python environment. A file lock prevents duplicate watchers.
 """
@@ -17,13 +17,26 @@ import tempfile
 import time
 
 
-TRAIN_COMMAND = shlex.join([
-    "python", "main/rl/train.py", "task=ResDexHand", "dexhand=artimano",
-    "side=BiH", "headless=true", "num_envs=4096", "learning_rate=2e-4",
-    "test=false", "randomStateInit=true", "dataIndices=[9fc3e@0]",
-    "early_stop_epochs=10000", "actionsMovingAverage=0.4",
-    "experiment=OakInk_9fc3e@0_kni@1_artimano", "new_obj=kni@1", "correct=true",
-])
+TRAIN_COMMAND = (
+    'OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=0 '
+    '"$SPIDER_TRAIN_ENV/bin/python" '
+    + shlex.join([
+        "-m", "main.rl.train", "task=ResDexHand", "side=BiH",
+        "bimanual_mode=united", "dexhand=artimano", "headless=true", "test=false",
+        "num_envs=4096", "learning_rate=2e-4", "max_iterations=10000",
+        "randomStateInit=false", "rolloutStateInit=false", "dataIndices=[9b728@0]",
+        "task.env.referenceSource=spider", "task.env.datasetType=spider",
+        "task.env.referenceRoot=/home/user/ylj/spider_maniptrans/data/retargeting_spider_native",
+        "task.env.referenceDataset=OakInk-v2", "task.env.newObj=spoon@1",
+        "task.env.objectReference=demonstration", "task.env.allowFailedReference=true",
+        "task.env.episodeLength=1500", "task.task.randomize=false",
+        "rl_train.params.config.horizon_length=32",
+        "rl_train.params.config.minibatch_size=1024",
+        "rh_base_model_checkpoint=/home/user/ylj/spider_maniptrans/assets/imitator_rh_artimano.pth",
+        "lh_base_model_checkpoint=/home/user/ylj/spider_maniptrans/assets/imitator_lh_artimano.pth",
+        "experiment=SPIDER_OakInk_9b728@0_spoon@1_artimano",
+    ])
+)
 
 
 def log(message):
@@ -55,8 +68,8 @@ def pane_info(target):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pid", type=int, default=24826, help="PID to watch")
-    parser.add_argument("--target", default="=0:0.0", help="tmux target pane")
+    parser.add_argument("--pid", type=int, default=65892, help="PID to watch")
+    parser.add_argument("--target", default="=1:0.0", help="tmux target pane")
     parser.add_argument("--interval", type=float, default=5, help="poll interval in seconds")
     parser.add_argument("--command", default=TRAIN_COMMAND, help="next shell command")
     parser.add_argument("--dry-run", action="store_true", help="validate and print; do not wait or send")

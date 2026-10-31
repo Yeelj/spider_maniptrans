@@ -53,7 +53,8 @@ class OakInk2DatasetDexHandRH(ManipData):
             **kwargs,
         )
 
-        pathes = os.listdir(os.path.join(data_dir, "anno_preview"))
+        pathes = [name for name in os.listdir(os.path.join(data_dir, "anno_preview"))
+                  if name.endswith(".pkl") and not name.startswith(".")]
         pathes = [os.path.join(data_dir, "anno_preview", p) for p in pathes]
         pathes.sort(key=lambda x: x.split("/")[-1])
         self.data_pathes = pathes
@@ -193,7 +194,7 @@ class OakInk2DatasetDexHandRH(ManipData):
         obj_id = self.new_obj if self.new_obj is not None else source_obj_id
         obj_mesh = load_obj_map(
             os.path.join(self.data_dir, "object_preview", "align_ds"),
-            object_list if self.new_obj is None else [obj_id],
+            [obj_id],
         )
         obj_mesh_trimesh, obj_mesh_path = obj_mesh[obj_id]
 

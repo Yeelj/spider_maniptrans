@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Replay bimanual TACO or OakInk-V2 retargeting results in Isaac Gym.
+"""Replay bimanual legacy or SPIDER retargeting results in Isaac Gym.
 
 The retargeting pickle contains only dexterous-hand states.  Object assets,
 object trajectories, and the source-to-Gym transform are intentionally loaded
 through the existing dataset loaders. ``--new_obj`` selects a replacement
 right-hand object from the corresponding dataset, retaining the original hand
-and object trajectories.
+and object trajectories. Use ``--reference_source spider`` to load the same
+validated SPIDER bundles and assets as training instead.
 """
 
+import argparse
 import os
 import pickle
 import sys
@@ -19,7 +21,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Isaac Gym must be imported before torch.
-from isaacgym import gymapi, gymtorch, gymutil
+try:
+    from isaacgym import gymapi, gymtorch, gymutil
+except ModuleNotFoundError as error:
+    if error.name != "isaacgym":
+        raise
+    raise SystemExit(
+        f"Isaac Gym is not visible to {sys.executable}. "
+        "Use the Python interpreter from the environment where Isaac Gym is installed; "
+        "see docs/retarget_visualization.md for physgraph launch commands."
+    ) from error
 
 import numpy as np
 import torch
@@ -28,6 +39,7 @@ from main.dataset.factory import ManipDataFactory
 from main.dataset.oakink2_dataset_utils import oakink2_obj_scale, oakink2_object_paths as _oakink2_object_paths
 from main.dataset.transform import aa_to_quat, aa_to_rotmat, rotmat_to_quat
 from maniptrans_envs.lib.envs.dexhands.factory import DexHandFactory
+from lib.utils.visualization import VisualizationConfig
 
 
 TABLE_WIDTH_OFFSET = 0.2
@@ -35,6 +47,28 @@ TABLE_HEIGHT = 0.03
 TABLE_POSITION = (-TABLE_WIDTH_OFFSET / 2, 0.0, 0.4)
 TABLE_SURFACE_Z = TABLE_POSITION[2] + TABLE_HEIGHT / 2
 REQUIRED_RETARGET_KEYS = ("opt_wrist_pos", "opt_wrist_rot", "opt_dof_pos")
+DEFAULT_REPLAY_COLORS = {
+    "right_hand": (0.35, 0.75, 0.95),
+    "left_hand": (0.75, 0.45, 0.95),
+    "object": (0.2, 0.7, 0.35),
+    "tool": (1.0, 0.45, 0.08),
+}
+
+
+def _parse_rgb(value):
+    try:
+        channels = [float(channel) for channel in value.split(",")]
+        return VisualizationConfig.from_mapping({"objectColor": channels}).object_color
+    except (AttributeError, TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("Expected three finite RGB values in [0,1], e.g. 0.35,0.75,0.95") from error
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise argparse.ArgumentTypeError("Expected true or false")
 
 
 def _oakink2_annotation_path(data_dir: Path, data_idx: str) -> Path:
@@ -157,6 +191,41 @@ def _validate_loaded_data(data, side: str, frame_count: int, expected_dofs: int)
         raise FileNotFoundError(f"Missing {side}-hand object URDF: {urdf_path}")
 
 
+def _load_spider_replay_data(args, device, dexhand_rh, dexhand_lh, dataset_dir):
+    from lib.utils.spider_reference import find_manifest, read_bundle
+
+    reference_root = Path(args.reference_root)
+    if not reference_root.is_absolute():
+        reference_root = PROJECT_ROOT / reference_root
+    manifest_path = find_manifest(reference_root, args.new_obj or None, dataset_dir, args.data_idx)
+    manifest, _ = read_bundle(manifest_path)
+    frame_count = manifest["recorded_frames"]
+    samples = []
+    for side, hand in (("right", dexhand_rh), ("left", dexhand_lh)):
+        dataset = ManipDataFactory.create_data(
+            manipdata_type="spider",
+            side=side,
+            dexhand=hand,
+            reference_root=str(reference_root),
+            reference_dataset=dataset_dir,
+            new_obj=args.new_obj or None,
+            object_reference=args.object_reference,
+            control_dt=1 / manifest["fps"],
+            device=device,
+        )
+        data = dataset[args.data_idx]
+        _validate_loaded_data(data, side, frame_count, hand.n_dofs)
+        samples.append(data)
+
+    print(f"SPIDER manifest: {manifest_path}")
+    print(f"Frames: {frame_count} at {manifest['fps']:g} Hz; playback: {args.playback_fps:g} FPS")
+    print(f"Object reference: {args.object_reference}; validation: {manifest['validation_status']}")
+    for side, data in zip(("Right", "Left"), samples):
+        print(f"{side} retarget: {data['data_path']}")
+        print(f"{side} object: {data['selected_asset_id']} ({data['obj_urdf_path']})")
+    return samples[0], samples[1], frame_count
+
+
 @torch.no_grad()
 def _load_replay_data(args, device, dexhand_rh, dexhand_lh):
     if not args.data_idx:
@@ -169,6 +238,9 @@ def _load_replay_data(args, device, dexhand_rh, dexhand_lh):
         )
 
     dataset_dir = "TACO" if dataset_type == "taco" else "OakInk-v2"
+    if args.reference_source == "spider":
+        return _load_spider_replay_data(args, device, dexhand_rh, dexhand_lh, dataset_dir)
+
     data_dir = Path(args.data_dir) if args.data_dir else PROJECT_ROOT / "data" / dataset_dir
     if not data_dir.is_absolute():
         data_dir = PROJECT_ROOT / data_dir
@@ -234,6 +306,24 @@ class TacoRetargetViewer:
             raise ValueError(f"start_frame must be non-negative, got {args.start_frame}")
 
         self.args = args
+        self.visualization = VisualizationConfig.from_mapping({
+            "rightHandColor": getattr(args, "right_hand_color", DEFAULT_REPLAY_COLORS["right_hand"]),
+            "leftHandColor": getattr(args, "left_hand_color", DEFAULT_REPLAY_COLORS["left_hand"]),
+            "objectColor": getattr(args, "object_color", DEFAULT_REPLAY_COLORS["object"]),
+            "toolColor": getattr(args, "tool_color", DEFAULT_REPLAY_COLORS["tool"]),
+            "preserveTextures": getattr(args, "preserve_textures", False),
+        })
+        self.visible = {
+            "hand_rh": getattr(args, "show_right_hand", True),
+            "hand_lh": getattr(args, "show_left_hand", True),
+            "object_rh": getattr(args, "show_tool", True),
+            "object_lh": getattr(args, "show_object", True),
+        }
+        if any(not isinstance(value, bool) for value in self.visible.values()):
+            raise ValueError("Replay visibility options must be true or false")
+        self._visualization_white_texture = None
+        if args.headless:
+            args.graphics_device_id = -1
         self.gym = gymapi.acquire_gym()
         self.sim = None
         self.viewer = None
@@ -327,10 +417,10 @@ class TacoRetargetViewer:
         return asset
 
     def _create_scene(self):
-        hand_rh_asset = self._load_hand_asset(self.dexhand_rh)
-        hand_lh_asset = self._load_hand_asset(self.dexhand_lh)
-        object_rh_asset = self._load_object_asset(self.rh_data["obj_urdf_path"])
-        object_lh_asset = self._load_object_asset(self.lh_data["obj_urdf_path"])
+        hand_rh_asset = self._load_hand_asset(self.dexhand_rh) if self.visible["hand_rh"] else None
+        hand_lh_asset = self._load_hand_asset(self.dexhand_lh) if self.visible["hand_lh"] else None
+        object_rh_asset = self._load_object_asset(self.rh_data["obj_urdf_path"]) if self.visible["object_rh"] else None
+        object_lh_asset = self._load_object_asset(self.lh_data["obj_urdf_path"]) if self.visible["object_lh"] else None
 
         table_options = gymapi.AssetOptions()
         table_options.fix_base_link = True
@@ -347,10 +437,10 @@ class TacoRetargetViewer:
         replay_filter = 1
         self.hand_rh_actor = self.gym.create_actor(
             self.env, hand_rh_asset, identity, "dexhand_r", 0, replay_filter
-        )
+        ) if self.visible["hand_rh"] else None
         self.hand_lh_actor = self.gym.create_actor(
             self.env, hand_lh_asset, identity, "dexhand_l", 0, replay_filter
-        )
+        ) if self.visible["hand_lh"] else None
 
         table_pose = gymapi.Transform()
         table_pose.p = gymapi.Vec3(*TABLE_POSITION)
@@ -359,46 +449,75 @@ class TacoRetargetViewer:
         )
         self.object_rh_actor = self.gym.create_actor(
             self.env, object_rh_asset, identity, "manip_obj_rh", 0, replay_filter
-        )
+        ) if self.visible["object_rh"] else None
         self.object_lh_actor = self.gym.create_actor(
             self.env, object_lh_asset, identity, "manip_obj_lh", 0, replay_filter
-        )
+        ) if self.visible["object_lh"] else None
+        self.actors = {
+            key: actor for key, actor in (
+                ("hand_rh", self.hand_rh_actor), ("hand_lh", self.hand_lh_actor),
+                ("object_rh", self.object_rh_actor), ("object_lh", self.object_lh_actor),
+            ) if actor is not None
+        }
         for actor, data in ((self.object_rh_actor, self.rh_data), (self.object_lh_actor, self.lh_data)):
-            scale = data.get("obj_scale", 1.0)
-            if scale != 1.0:
+            scale = data.get("object_scale", data.get("obj_scale", 1.0))
+            if actor is not None and scale != 1.0:
                 self.gym.set_actor_scale(self.env, actor, scale)
 
-        self._set_actor_color(self.hand_rh_actor, gymapi.Vec3(0.35, 0.75, 0.95))
-        self._set_actor_color(self.hand_lh_actor, gymapi.Vec3(0.75, 0.45, 0.95))
-        self._set_actor_color(self.object_rh_actor, gymapi.Vec3(1.0, 0.45, 0.08))
-        self._set_actor_color(self.object_lh_actor, gymapi.Vec3(0.2, 0.7, 0.35))
-        self._set_actor_color(self.table_actor, gymapi.Vec3(0.12, 0.12, 0.12))
+        colors = {
+            "hand_rh": self.visualization.right_hand_color, "hand_lh": self.visualization.left_hand_color,
+            "object_rh": self.visualization.tool_color, "object_lh": self.visualization.object_color,
+        }
+        for key, actor in self.actors.items():
+            self._set_actor_color(actor, colors[key])
+        self.gym.set_rigid_body_color(self.env, self.table_actor, 0, gymapi.MESH_VISUAL, gymapi.Vec3(0.12, 0.12, 0.12))
 
     def _set_actor_color(self, actor, color):
+        if color is None or self.args.graphics_device_id < 0:
+            return
+        if not self.visualization.preserve_textures and self._visualization_white_texture is None:
+            self._visualization_white_texture = self.gym.create_texture_from_buffer(
+                self.sim, 1, 1, np.full((1, 4), 255, dtype=np.uint8)
+            )
+            if self._visualization_white_texture == gymapi.INVALID_HANDLE:
+                raise RuntimeError("Failed to create the neutral visualization texture")
         body_count = self.gym.get_actor_rigid_body_count(self.env, actor)
         for body_index in range(body_count):
-            self.gym.set_rigid_body_color(self.env, actor, body_index, gymapi.MESH_VISUAL, color)
+            if not self.visualization.preserve_textures:
+                self.gym.set_rigid_body_texture(
+                    self.env, actor, body_index, gymapi.MESH_VISUAL, self._visualization_white_texture
+                )
+            self.gym.set_rigid_body_color(self.env, actor, body_index, gymapi.MESH_VISUAL, gymapi.Vec3(*color))
 
     def _acquire_state_tensors(self):
         root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
-        dof_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         self.root_state = gymtorch.wrap_tensor(root_tensor).view(-1, 13)
-        self.dof_state = gymtorch.wrap_tensor(dof_tensor).view(-1, 2)
-
         self.actor_indices = {
-            "hand_rh": self.gym.get_actor_index(self.env, self.hand_rh_actor, gymapi.DOMAIN_SIM),
-            "hand_lh": self.gym.get_actor_index(self.env, self.hand_lh_actor, gymapi.DOMAIN_SIM),
-            "object_rh": self.gym.get_actor_index(self.env, self.object_rh_actor, gymapi.DOMAIN_SIM),
-            "object_lh": self.gym.get_actor_index(self.env, self.object_lh_actor, gymapi.DOMAIN_SIM),
+            key: self.gym.get_actor_index(self.env, actor, gymapi.DOMAIN_SIM) for key, actor in self.actors.items()
         }
 
-        expected_dofs = self.dexhand_rh.n_dofs + self.dexhand_lh.n_dofs
-        if self.dof_state.shape[0] != expected_dofs:
+        hands = {"hand_rh": self.dexhand_rh, "hand_lh": self.dexhand_lh}
+        expected_dofs = sum(hand.n_dofs for key, hand in hands.items() if key in self.actors)
+        actual_dofs = self.gym.get_sim_dof_count(self.sim)
+        if actual_dofs != expected_dofs:
             raise RuntimeError(
-                f"Unexpected simulation DOF count: {self.dof_state.shape[0]}, expected {expected_dofs}"
+                f"Unexpected simulation DOF count: {actual_dofs}, expected {expected_dofs}"
             )
-        self.rh_dof_slice = slice(0, self.dexhand_rh.n_dofs)
-        self.lh_dof_slice = slice(self.dexhand_rh.n_dofs, expected_dofs)
+        self.dof_state = None
+        self.hand_dof_indices = {}
+        # PhysX has no DOF tensor for an object-only or table-only scene.
+        if expected_dofs == 0:
+            return
+        dof_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        self.dof_state = gymtorch.wrap_tensor(dof_tensor).view(-1, 2)
+        for key, hand in hands.items():
+            if key not in self.actors:
+                continue
+            indices = [self.gym.find_actor_dof_index(self.env, self.actors[key], name, gymapi.DOMAIN_SIM)
+                       for name in hand.dof_names]
+            if len(set(indices)) != hand.n_dofs or any(index < 0 or index >= actual_dofs for index in indices):
+                raise RuntimeError(f"Invalid simulation DOF indices for {key}: {indices}")
+            self.hand_dof_indices[key] = torch.tensor(indices, dtype=torch.long, device=self.device)
 
     def _prepare_trajectories(self):
         self.hand_rh_pos = self.rh_data["opt_wrist_pos"].to(self.device, dtype=torch.float32)
@@ -415,7 +534,17 @@ class TacoRetargetViewer:
         self.object_rh_quat = rotmat_to_quat(rh_object[:, :3, :3])[:, [1, 2, 3, 0]]
         self.object_lh_quat = rotmat_to_quat(lh_object[:, :3, :3])[:, [1, 2, 3, 0]]
 
+    def _camera_center(self):
+        positions = [getattr(self, key + "_pos") for key in self.actors]
+        if not positions:
+            return np.asarray(TABLE_POSITION, dtype=np.float32)
+        all_positions = torch.cat(positions, dim=0)
+        center = (all_positions.amin(dim=0) + all_positions.amax(dim=0)) / 2
+        return center.detach().cpu().numpy()
+
     def _create_viewer(self):
+        if self.args.headless:
+            return
         self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
         if self.viewer is None:
             raise RuntimeError("Failed to create the Isaac Gym viewer")
@@ -423,11 +552,7 @@ class TacoRetargetViewer:
         self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_SPACE, "pause")
         self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_R, "restart")
 
-        all_positions = torch.cat(
-            [self.hand_rh_pos, self.hand_lh_pos, self.object_rh_pos, self.object_lh_pos], dim=0
-        )
-        center = (all_positions.amin(dim=0) + all_positions.amax(dim=0)) / 2
-        center = center.detach().cpu().numpy()
+        center = self._camera_center()
         camera_target = gymapi.Vec3(float(center[0]), float(center[1]), float(center[2]))
         camera_position = gymapi.Vec3(
             float(center[0] + 0.9), float(center[1] + 0.9), float(max(center[2] + 0.65, 0.8))
@@ -442,23 +567,24 @@ class TacoRetargetViewer:
         state[7:13] = 0
 
     def _set_frame(self, frame: int):
-        self._write_root_pose("hand_rh", self.hand_rh_pos[frame], self.hand_rh_quat[frame])
-        self._write_root_pose("hand_lh", self.hand_lh_pos[frame], self.hand_lh_quat[frame])
-        self._write_root_pose("object_rh", self.object_rh_pos[frame], self.object_rh_quat[frame])
-        self._write_root_pose("object_lh", self.object_lh_pos[frame], self.object_lh_quat[frame])
-        self.dof_state[:, 1] = 0
-        self.dof_state[self.rh_dof_slice, 0] = self.hand_rh_dof[frame]
-        self.dof_state[self.lh_dof_slice, 0] = self.hand_lh_dof[frame]
+        for key in self.actors:
+            self._write_root_pose(key, getattr(self, key + "_pos")[frame], getattr(self, key + "_quat")[frame])
+        if self.dof_state is not None:
+            self.dof_state[:, 1] = 0
+            for key, indices in self.hand_dof_indices.items():
+                self.dof_state[indices, 0] = getattr(self, key + "_dof")[frame]
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_state))
-        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
+        if self.dof_state is not None:
+            self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
 
     def run(self):
         frame = self.args.start_frame
         paused = False
         quit_requested = False
-        while not quit_requested and not self.gym.query_viewer_has_closed(self.viewer):
+        while not quit_requested and (self.viewer is None or not self.gym.query_viewer_has_closed(self.viewer)):
             restart_requested = False
-            for event in self.gym.query_viewer_action_events(self.viewer):
+            events = self.gym.query_viewer_action_events(self.viewer) if self.viewer is not None else ()
+            for event in events:
                 if event.value <= 0:
                     continue
                 if event.action == "quit":
@@ -481,13 +607,14 @@ class TacoRetargetViewer:
                 self.gym.fetch_results(self.sim, True)
                 reached_end = frame + 1 >= self.frame_count
 
-            self.gym.step_graphics(self.sim)
-            self.gym.draw_viewer(self.viewer, self.sim, True)
-            self.gym.sync_frame_time(self.sim)
+            if self.viewer is not None:
+                self.gym.step_graphics(self.sim)
+                self.gym.draw_viewer(self.viewer, self.sim, True)
+                self.gym.sync_frame_time(self.sim)
 
             if not paused:
                 if reached_end:
-                    if self.args.once:
+                    if self.args.once or self.args.headless:
                         break
                     frame = self.args.start_frame
                 else:
@@ -503,10 +630,28 @@ class TacoRetargetViewer:
 
 
 def parse_args():
-    return gymutil.parse_arguments(
-        description="Replay bimanual TACO or OakInk-V2 retargeting results in Isaac Gym",
-        headless=False,
+    args = gymutil.parse_arguments(
+        description="Replay bimanual legacy or SPIDER retargeting results in Isaac Gym",
+        headless=True,
         custom_parameters=[
+            {
+                "name": "--reference_source",
+                "type": str,
+                "default": "legacy",
+                "help": "Trajectory source: original retarget pickles or validated SPIDER training bundles",
+            },
+            {
+                "name": "--reference_root",
+                "type": str,
+                "default": "data/retargeting_spider_native",
+                "help": "SPIDER bundle root, relative to the project root unless absolute",
+            },
+            {
+                "name": "--object_reference",
+                "type": str,
+                "default": "spider_rollout",
+                "help": "SPIDER object poses: actual physical replay (default) or aligned demonstration targets",
+            },
             {
                 "name": "--data_idx",
                 "type": str,
@@ -528,7 +673,7 @@ def parse_args():
                 "name": "--new_obj",
                 "type": str,
                 "default": "",
-                "help": "Right-hand replacement object ID: TACO 004, or OakInk-V2 O02@0015@00004, for example",
+                "help": "Legacy replacement object ID (004 or O02@0015@00004); SPIDER tool namespace (045 or kni@1)",
             },
             {
                 "name": "--playback_fps",
@@ -547,8 +692,25 @@ def parse_args():
                 "action": "store_true",
                 "help": "Exit after one playback instead of looping",
             },
+        ] + [
+            {"name": f"--{entity}_color", "type": _parse_rgb, "default": color,
+             "help": f"{entity} RGB as r,g,b with finite channels in [0,1]"}
+            for entity, color in DEFAULT_REPLAY_COLORS.items()
+        ] + [
+            {"name": f"--show_{entity}", "type": _parse_bool, "default": True,
+             "help": f"Display {entity}: true or false (default: true)"}
+            for entity in ("left_hand", "right_hand", "object", "tool")
+        ] + [
+            {"name": "--preserve_textures", "type": _parse_bool, "default": False,
+             "help": "Keep imported textures and tint with RGB; false uses a neutral white texture"},
         ],
     )
+    # gymutil only forwards name/type/default/help, not argparse's choices.
+    if args.reference_source not in ("legacy", "spider"):
+        raise ValueError("--reference_source must be legacy or spider")
+    if args.object_reference not in ("spider_rollout", "demonstration"):
+        raise ValueError("--object_reference must be spider_rollout or demonstration")
+    return args
 
 
 def main():

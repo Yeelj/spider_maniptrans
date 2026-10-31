@@ -150,6 +150,7 @@ isolated_run
 isolated_run/*
 
 *.sh
+!scripts/visualize_spider_retarget.sh
 *.conf
 *.slurm
 *.out
@@ -185,6 +186,10 @@ tmp*.py
 eval*.py
 test*.py
 !tests/test_semantic_contact_eval.py
+!tests/test_spider_reference.py
+!tests/test_visualization.py
+!tests/test_retarget_visualization.py
+!tests/test_episode_statistics.py
 annotator*.py
 make*.py
 

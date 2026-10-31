@@ -28,7 +28,8 @@ class Runner(_Runner):
 
     def run_play(self, args):
         print("Started to play")
-        save_rollouts_cfg = args.get("save_rollouts", {})
+        save_rollouts_cfg = dict(args.get("save_rollouts", {}))
+        save_rollouts_cfg.update(args.get("test_statistics", {}))
         player = self.create_player(save_rollouts_cfg)
         _restore(player, args, is_train_restore=False)
         _override_sigma(player, args)

@@ -87,7 +87,14 @@ class MyBasePlayer(object):
         num_rollouts_to_run: int = 1e10,
         # weird bug in states if episodes are too short
         min_episode_length: int = 25,
+        test_episodes: Optional[int] = None,
+        test_output_dir: Optional[str] = None,
     ):
+        from lib.utils.episode_statistics import validate_test_episodes
+        self.test_episodes = validate_test_episodes(test_episodes)
+        self.test_output_dir = test_output_dir
+        if self.test_episodes is not None and test_output_dir is None:
+            raise ValueError("test_output_dir is required when test_episodes is set")
         self.config = config = params["config"]
         self.load_networks(params)
         self.env_name = self.config["env_name"]
@@ -361,7 +368,54 @@ class MyBasePlayer(object):
                 for s in rnn_states
             ]
 
+    def _save_completed_rollouts(self, done_indices, success_buf, rollouts, rollouts_actions, bounded=False):
+        """Keep legacy filtering/alignment; finite tests own their episode stopping limit."""
+        env_ids = done_indices.flatten().tolist()
+        done_count = len(env_ids)
+        self.prev_done_count_sum += done_count
+        for env_id in env_ids:
+            if len(rollouts[env_id]) >= self.min_episode_length:
+                successful = bool(success_buf[env_id])
+                rollout_to_save = stack_sequence_fields(rollouts[env_id])
+                # The last action belongs to the terminal state and is not applied.
+                rollout_to_save["actions"] = np.stack(rollouts_actions[env_id][:-1], axis=0)
+                # Preserve the existing workaround for invalid Isaac Gym initialization data.
+                rollout_to_save = {k: v[1:] for k, v in rollout_to_save.items()}
+                to_save = (self.prev_done_count_sum - done_count) > self.env.num_envs * 2
+                if bounded and self.saved_successful_rollouts + self.saved_failed_rollouts >= self.num_rollouts_to_save:
+                    to_save = False
+                if to_save and (successful or not self.save_successful_rollouts_only):
+                    if successful:
+                        group = self.s_grp.create_group(f"rollout_{self.saved_successful_rollouts}")
+                    else:
+                        group = self.f_grp.create_group(f"rollout_{self.saved_failed_rollouts}")
+                    for key, value in rollout_to_save.items():
+                        group.create_dataset(key, data=value)
+                    if successful:
+                        self.saved_successful_rollouts += 1
+                    else:
+                        self.saved_failed_rollouts += 1
+            rollouts[env_id] = []
+            rollouts_actions[env_id] = []
+            if not bounded and self.saved_successful_rollouts + self.saved_failed_rollouts >= self.num_rollouts_to_save:
+                self.h5py_file.close()
+                exit()
+        if not bounded and self.prev_done_count_sum >= self.num_rollouts_to_run:
+            self.h5py_file.close()
+            exit()
+
     def run(self):
+        if self.test_episodes is None:
+            return self._run()
+        from lib.utils.episode_statistics import EpisodeStatistics
+        try:
+            with EpisodeStatistics(self.test_episodes, self.test_output_dir, self.print_stats) as recorder:
+                return self._run(recorder)
+        finally:
+            if self.h5py_file is not None:
+                self.h5py_file.close()
+
+    def _run(self, episode_recorder=None):
         render = self.render_env
         is_deterministic = self.is_deterministic
         sum_rewards = 0
@@ -425,57 +479,10 @@ class MyBasePlayer(object):
 
                 if prev_done is not None:
                     prev_done_indices = prev_done.nonzero(as_tuple=False)
-                    prev_done_count = len(done_indices)
-                    if prev_done_count > 0:
-                        self.prev_done_count_sum += prev_done_count
-                        for prev_done_idx in prev_done_indices:
-                            # there are some weird bugs in furniture's states when episodes are too short
-                            if len(rollouts[prev_done_idx]) < self.min_episode_length:
-                                rollouts[prev_done_idx] = []
-                                rollouts_actions[prev_done_idx] = []
-                            else:
-                                successful = prev_success_buf[prev_done_idx]
-                                rollout_to_save = rollouts[prev_done_idx]
-                                actions_to_save = np.stack(
-                                    rollouts_actions[prev_done_idx][:-1], axis=0
-                                )  # :-1 is because the last action is corresponding to the terminal state
-                                rollout_to_save = stack_sequence_fields(rollout_to_save)  # dict of (T + 1, ...)
-                                rollout_to_save["actions"] = actions_to_save
-                                # discard first step since the data are wrong due to IG's bug
-                                rollout_to_save = {k: v[1:] for k, v in rollout_to_save.items()}
-
-                                # Currently, there are some strange bugs during IG initialization
-                                # so we don’t save the first few rollouts
-                                to_save_flag = (self.prev_done_count_sum - prev_done_count) > self.env.num_envs * 2
-                                if to_save_flag and self.save_successful_rollouts_only and successful:
-                                    rollout_grp = self.s_grp.create_group(f"rollout_{self.saved_successful_rollouts}")
-                                    for k, v in rollout_to_save.items():
-                                        rollout_grp.create_dataset(k, data=v)
-                                    self.saved_successful_rollouts += 1
-                                elif to_save_flag and not self.save_successful_rollouts_only:
-                                    if successful:
-                                        rollout_grp = self.s_grp.create_group(
-                                            f"rollout_{self.saved_successful_rollouts}"
-                                        )
-                                    else:
-                                        rollout_grp = self.f_grp.create_group(f"rollout_{self.saved_failed_rollouts}")
-                                    for k, v in rollout_to_save.items():
-                                        rollout_grp.create_dataset(k, data=v)
-                                    if successful:
-                                        self.saved_successful_rollouts += 1
-                                    else:
-                                        self.saved_failed_rollouts += 1
-                                rollouts[prev_done_idx] = []
-                                rollouts_actions[prev_done_idx] = []
-                                if (
-                                    self.saved_successful_rollouts + self.saved_failed_rollouts
-                                ) >= self.num_rollouts_to_save:
-                                    self.h5py_file.close()
-                                    exit()
-
-                        if self.prev_done_count_sum >= self.num_rollouts_to_run:
-                            self.h5py_file.close()
-                            exit()
+                    if len(prev_done_indices) > 0:
+                        self._save_completed_rollouts(
+                            prev_done_indices, prev_success_buf, rollouts, rollouts_actions,
+                            bounded=episode_recorder is not None)
 
             obses, r, done, info = self.env_step(self.env, actions)
             prev_done = done.clone()
@@ -498,7 +505,9 @@ class MyBasePlayer(object):
             if done_count > 0:
                 semantic_summary = None
                 snapshot = info.get("semantic_contact_eval")
-                if snapshot is not None:
+                if episode_recorder is not None:
+                    accepted_ids = episode_recorder.add_batch(done_indices, cr, steps, snapshot)
+                elif snapshot is not None:
                     from main.semantic_contact_eval import SemanticContactSummary
                     if semantic_totals is None:
                         semantic_totals = SemanticContactSummary()
@@ -515,7 +524,20 @@ class MyBasePlayer(object):
                 sum_rewards += cur_rewards
                 sum_steps += cur_steps
 
-                if self.print_stats:
+                if episode_recorder is not None:
+                    if episode_recorder.complete:
+                        if self.save_rollouts:
+                            # Preserve the terminal state without resetting or taking another physics step.
+                            for env_id in accepted_ids:
+                                rollouts[env_id].append({k: v[env_id].detach().cpu().numpy().copy()
+                                                         for k, v in self.env.dump_fileds.items()})
+                                # The serializer discards this terminal placeholder action.
+                                rollouts_actions[env_id].append(actions[env_id].cpu().numpy())
+                            self._save_completed_rollouts(
+                                done_indices.new_tensor(accepted_ids), prev_success_buf,
+                                rollouts, rollouts_actions, bounded=True)
+                        return
+                elif self.print_stats:
                     cur_rewards_done = cur_rewards / done_count
                     cur_steps_done = cur_steps / done_count
                     message = f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}"

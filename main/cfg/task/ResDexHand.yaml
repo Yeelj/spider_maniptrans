@@ -19,10 +19,31 @@ env:
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
   new_obj: ${...new_obj}
+  # Legacy keeps the original dataset routing and retarget initialization.
+  referenceSource: legacy             # legacy | spider
+  datasetType: null                   # must be spider in SPIDER mode
+  referenceRoot: data/retargeting_spider_native
+  referenceDataset: null              # OakInk-v2 | TACO
+  newObj: null                        # SPIDER namespace; null means original
+  objectReference: demonstration      # demonstration | spider_rollout
+  allowFailedReference: true
+  assetRoot: null
+  assetPathMap: {}                    # explicit old absolute root -> new root
   obsFutureLength: 1
 
   rolloutLen: ${resolve_default:None,${...rolloutLen}}
   rolloutBegin: ${resolve_default:None,${...rolloutBegin}}
+
+  # ResDexHandBiH display options (legacy and SPIDER). Defaults preserve the
+  # existing appearance. RGB channels are in [0, 1]; null keeps asset colors.
+  visualization:
+    rightHandColor: null
+    leftHandColor: null
+    objectColor: null                 # left-hand target, manip_obj_lh
+    toolColor: null                   # right-hand tool, manip_obj_rh
+    showReferenceSkeleton: true       # viewer joint spheres and bone lines
+    showContactHighlight: true        # pink contacts; otherwise base hand color
+    preserveTextures: false           # applies only to actors with custom colors
 
   # Independent of policy inputs. Test-only metrics for ResDexHandBiH.
   semanticContactEval:

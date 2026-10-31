@@ -16,6 +16,7 @@ from isaacgym.torch_utils import normalize_angle, quat_conjugate, quat_mul
 from copy import deepcopy
 import math
 from maniptrans_envs.lib.envs.dexhands.factory import DexHandFactory
+from lib.utils.visualization import VisualizationConfig
 from main.dataset.factory import ManipDataFactory
 
 # from main.dataset.favor_dataset_dexhand import FavorDatasetDexHand
@@ -53,6 +54,16 @@ class DexHandManipBiHEnv(VecTask):
     ):
         self._record = record
         self.cfg = cfg
+        self.visualization = VisualizationConfig.from_mapping(cfg["env"].get("visualization"))
+        self._visualization_white_texture = None
+        # Keep the existing headless behavior: reference geometry belongs to
+        # the viewer, while actor colors also apply to camera sensor images.
+        self.show_reference_skeleton = self.visualization.show_reference_skeleton and not headless
+        self.reference_source = cfg["env"].get("referenceSource", "legacy")
+        if self.reference_source not in ("legacy", "spider"):
+            raise ValueError("referenceSource must be legacy or spider")
+        if self.reference_source == "spider" and cfg["env"].get("datasetType") != "spider":
+            raise ValueError("SPIDER references require task.env.datasetType=spider")
 
         use_quat_rot = self.use_quat_rot = self.cfg["env"]["useQuatRot"]
         self.max_episode_length = self.cfg["env"]["episodeLength"]
@@ -99,6 +110,13 @@ class DexHandManipBiHEnv(VecTask):
 
         self.dataIndices = self.cfg["env"]["dataIndices"]
         self.new_obj = self.cfg["env"].get("new_obj", None)
+        if self.reference_source == "spider":
+            from lib.utils.spider_reference import normalize_tool
+            selected = self.cfg["env"].get("newObj")
+            dataset = self.cfg["env"].get("referenceDataset")
+            if self.new_obj is not None and normalize_tool(self.new_obj, dataset) != normalize_tool(selected, dataset):
+                raise ValueError("new_obj and task.env.newObj disagree; use task.env.newObj in SPIDER mode")
+            self.new_obj = selected
         # self.dataIndices = [tuple([int(i) for i in idx.split("@")]) for idx in self.dataIndices]
         self.obs_future_length = self.cfg["env"]["obsFutureLength"]
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
@@ -261,6 +279,8 @@ class DexHandManipBiHEnv(VecTask):
         end_frames = full_fragment_end(
             self.demo_data_rh["seq_len"], self.demo_data_lh["seq_len"], self.max_episode_length
         )
+        if getattr(self, "reference_source", "legacy") == "spider":
+            end_frames = torch.minimum(self.demo_data_rh["seq_len"], self.demo_data_lh["seq_len"]) - 1
         metadata_paths = dict(eval_cfg.get("contactMetadataPaths", {}))
         if config.contactRequiredMaskFile is None:
             for data_idx in self.dataIndices:
@@ -330,8 +350,11 @@ class DexHandManipBiHEnv(VecTask):
         mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
         self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
-        dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
-        if self.new_obj is not None:
+        if not self.dataIndices:
+            raise ValueError("dataIndices must contain at least one task")
+        dataset_list = (["spider"] if self.reference_source == "spider" else
+                        list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices])))
+        if self.new_obj is not None and self.reference_source == "legacy":
             unsupported_datasets = sorted(
                 dataset_type for dataset_type in dataset_list if dataset_type not in ("taco", "oakink2")
             )
@@ -347,6 +370,22 @@ class DexHandManipBiHEnv(VecTask):
         self.demo_dataset_rh_dict = {}
 
         for dataset_type in dataset_list:
+            shared_kwargs = {}
+            if dataset_type == "spider":
+                from hydra.utils import to_absolute_path
+                root = self.cfg["env"].get("referenceRoot")
+                if not root:
+                    raise ValueError("SPIDER mode requires referenceRoot")
+                shared_kwargs = dict(
+                    reference_root=to_absolute_path(root),
+                    reference_dataset=self.cfg["env"].get("referenceDataset"),
+                    new_obj=self.new_obj,
+                    object_reference=self.cfg["env"].get("objectReference", "demonstration"),
+                    allow_failed_reference=self.cfg["env"].get("allowFailedReference", True),
+                    asset_root=self.cfg["env"].get("assetRoot"),
+                    asset_path_map=self.cfg["env"].get("assetPathMap", {}),
+                    control_dt=self.cfg["sim"]["dt"] * self.cfg["env"].get("controlFrequencyInv", 1),
+                )
             self.demo_dataset_lh_dict[dataset_type] = ManipDataFactory.create_data(
                 manipdata_type=dataset_type,
                 side="left",
@@ -355,6 +394,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_lh,
                 embodiment=self.cfg["env"]["dexhand"],
+                **shared_kwargs,
             )
             rh_dataset_kwargs = {}
             if dataset_type in ("taco", "oakink2"):
@@ -367,6 +407,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_rh,
                 embodiment=self.cfg["env"]["dexhand"],
+                **shared_kwargs,
                 **rh_dataset_kwargs,
             )
 
@@ -386,6 +427,10 @@ class DexHandManipBiHEnv(VecTask):
         asset_options.use_mesh_materials = True
         dexhand_rh_asset = self.gym.load_asset(self.sim, *os.path.split(dexhand_rh_asset_file), asset_options)
         dexhand_lh_asset = self.gym.load_asset(self.sim, *os.path.split(dexhand_lh_asset_file), asset_options)
+        if self.reference_source == "spider":
+            for side, asset in (("rh", dexhand_rh_asset), ("lh", dexhand_lh_asset)):
+                if list(self.gym.get_asset_dof_names(asset)) != list(getattr(self, "dexhand_" + side).dof_names):
+                    raise ValueError("PhysX DOF order differs from the training hand: " + side)
         dexhand_rh_dof_stiffness = torch.tensor(
             [500] * self.dexhand_rh.n_dofs,
             dtype=torch.float,
@@ -498,12 +543,30 @@ class DexHandManipBiHEnv(VecTask):
         def segment_data(k, data_dict):
             todo_list = self.dataIndices
             idx = todo_list[k % len(todo_list)]
-            return data_dict[ManipDataFactory.dataset_type(idx)][idx]
+            dtype = "spider" if self.reference_source == "spider" else ManipDataFactory.dataset_type(idx)
+            return data_dict[dtype][idx]
 
         self.demo_data_lh = [segment_data(i, self.demo_dataset_lh_dict) for i in tqdm(range(self.num_envs))]
         self.demo_data_lh = self.pack_data(self.demo_data_lh, side="lh")
         self.demo_data_rh = [segment_data(i, self.demo_dataset_rh_dict) for i in tqdm(range(self.num_envs))]
         self.demo_data_rh = self.pack_data(self.demo_data_rh, side="rh")
+        if self.reference_source == "spider":
+            for key in ("seq_len",):
+                if not torch.equal(self.demo_data_rh[key], self.demo_data_lh[key]):
+                    raise ValueError("SPIDER hands have different time axes")
+            for key in ("manifest_path", "reference_task", "reference_trajectory_sha256", "object_reference", "reference_fps"):
+                if self.demo_data_rh[key] != self.demo_data_lh[key]:
+                    raise ValueError("SPIDER hands come from different bundles: " + key)
+            import warnings
+            for side in ("rh", "lh"):
+                demo = getattr(self, "demo_data_" + side)
+                limits = self.limit_info[side]
+                q = demo["opt_dof_pos"]
+                lower = torch.as_tensor(limits["lower"], device=q.device)
+                upper = torch.as_tensor(limits["upper"], device=q.device)
+                violation = torch.maximum(lower - q, q - upper).clamp_min(0).max().item()
+                if violation > 0.05:
+                    warnings.warn("SPIDER {} maximum DOF limit violation {:.6f} rad; reset clamps execution only, reference is preserved".format(side, violation))
 
         # Create environments
         self.manip_obj_rh_mass = []
@@ -527,7 +590,7 @@ class DexHandManipBiHEnv(VecTask):
                 + 1
                 + rh_sum_rigid_body_count
                 + lh_sum_rigid_body_count
-                + (0 + (0 + self.dexhand_lh.n_bodies * 2 if not self.headless else 0))
+                + (self.dexhand_rh.n_bodies + self.dexhand_lh.n_bodies if self.show_reference_skeleton else 0)
             )  # 1 for table
             max_agg_shapes = (
                 num_dexhand_rh_shapes
@@ -535,7 +598,7 @@ class DexHandManipBiHEnv(VecTask):
                 + 1
                 + rh_sum_rigid_shape_count
                 + lh_sum_rigid_shape_count
-                + (0 + (0 + self.dexhand_lh.n_bodies * 2 if not self.headless else 0))
+                + (self.dexhand_rh.n_bodies + self.dexhand_lh.n_bodies if self.show_reference_skeleton else 0)
                 + (1 if self._record else 0)
             )
             # Create actors and define aggregate group appropriately depending on setting
@@ -569,6 +632,8 @@ class DexHandManipBiHEnv(VecTask):
                 i,
                 (1 if self.dexhand_lh.self_collision else 0),
             )
+            self._set_actor_color(env_ptr, dexhand_rh_actor, self.visualization.right_hand_color)
+            self._set_actor_color(env_ptr, dexhand_lh_actor, self.visualization.left_hand_color)
             self.gym.enable_actor_dof_force_sensors(env_ptr, dexhand_rh_actor)
             self.gym.enable_actor_dof_force_sensors(env_ptr, dexhand_lh_actor)
             self.gym.set_actor_dof_properties(env_ptr, dexhand_rh_actor, dexhand_rh_dof_props)
@@ -640,6 +705,12 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_lh_handles = {
             k: self.gym.find_actor_rigid_body_handle(env_ptr, dexhand_lh_handle, k) for k in self.dexhand_lh.body_names
         }
+        # Color APIs require actor-relative body indices, whereas contact
+        # tensors above use environment-relative handles.
+        self._hand_visual_body_indices = {
+            "rh": self.gym.get_actor_rigid_body_dict(env_ptr, dexhand_rh_handle),
+            "lh": self.gym.get_actor_rigid_body_dict(env_ptr, dexhand_lh_handle),
+        }
         self.dexhand_rh_cf_weights = {
             k: (1.0 if ("intermediate" in k or "distal" in k) else 0.0) for k in self.dexhand_rh.body_names
         }
@@ -665,7 +736,7 @@ class DexHandManipBiHEnv(VecTask):
         self._lh_base_state = self._root_state[:, 1, :]
 
         # ? >>> for visualization
-        if not self.headless:
+        if self.show_reference_skeleton:
 
             self.mano_joint_rh_points = [
                 self._root_state[:, self.gym.find_actor_handle(env_ptr, f"rh_mano_joint_{i}"), :]
@@ -746,9 +817,12 @@ class DexHandManipBiHEnv(VecTask):
         self.lh_tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
 
     def pack_data(self, data, side="rh"):
+        spider = data[0].get("reference_source") == "spider"
+        if any((d.get("reference_source") == "spider") != spider for d in data):
+            raise ValueError("Cannot mix legacy and SPIDER references in one batch")
         packed_data = {}
         packed_data["seq_len"] = torch.tensor([len(d["obj_trajectory"]) for d in data], device=self.device)
-        max_len = packed_data["seq_len"].max()
+        max_len = int(packed_data["seq_len"].max().item())
         assert max_len <= self.max_episode_length, "max_len should be less than max_episode_length"
 
         def fill_data(stack_data):
@@ -763,9 +837,12 @@ class DexHandManipBiHEnv(VecTask):
                         ],
                         dim=0,
                     )
-            return torch.stack(stack_data).squeeze()
+            stacked = torch.stack(stack_data)
+            return stacked if spider else stacked.squeeze()
 
         for k in data[0].keys():
+            if spider and k in ("reference_joint_pos", "reference_joint_velocity", "mano_joints", "mano_joints_velocity"):
+                continue
             if k == "mano_joints" or k == "mano_joints_velocity":
                 mano_joints = []
                 for d in data:
@@ -797,11 +874,21 @@ class DexHandManipBiHEnv(VecTask):
                 if k != "obj_verts":
                     packed_data[k] = fill_data(stack_data)
                 else:
-                    packed_data[k] = torch.stack(stack_data).squeeze()
+                    stacked = torch.stack(stack_data)
+                    packed_data[k] = stacked if spider else stacked.squeeze()
             elif type(data[0][k]) == np.ndarray:
                 raise RuntimeError("Using np is very slow.")
             else:
                 packed_data[k] = [d[k] for d in data]
+        if spider:
+            dexhand = getattr(self, "dexhand_" + side)
+            if dexhand.body_names[0] != "palm":
+                raise ValueError("Robot references require palm at body index zero")
+            # Compatibility field names only: these are distinct robot links,
+            # never passed through the many-to-one human to_hand mapping.
+            for target, source in (("mano_joints", "reference_joint_pos"),
+                                   ("mano_joints_velocity", "reference_joint_velocity")):
+                packed_data[target] = fill_data([d[source][:, 1:].reshape(len(d[source]), -1) for d in data])
         return packed_data
 
     def allocate_buffers(self):
@@ -825,8 +912,14 @@ class DexHandManipBiHEnv(VecTask):
         else:
             obj_id = self.demo_data_lh["obj_id"][i]
 
-        if obj_id in self.objs_assets:
-            current_asset = self.objs_assets[obj_id]
+        demo = getattr(self, "demo_data_" + side)
+        spider = "reference_source" in demo and demo["reference_source"][i] == "spider"
+        obj_urdf_path = demo["obj_urdf_path"][i]
+        asset_key = ((obj_id, os.path.realpath(obj_urdf_path), demo["object_density"][i],
+                      demo["object_friction"][i], demo["object_rolling_friction"][i],
+                      demo["object_torsion_friction"][i]) if spider else obj_id)
+        if asset_key in self.objs_assets:
+            current_asset = self.objs_assets[asset_key]
         else:
             asset_options = gymapi.AssetOptions()
             asset_options.override_com = True
@@ -841,6 +934,8 @@ class DexHandManipBiHEnv(VecTask):
             asset_options.vhacd_params = gymapi.VhacdParams()
             asset_options.vhacd_params.resolution = 200000
             asset_options.density = 200  # * the average density of low-fill-rate 3D-printed models
+            if spider:
+                asset_options.density = demo["object_density"][i]
             if side == "rh":
                 obj_urdf_path = self.demo_data_rh["obj_urdf_path"][i]
             else:
@@ -849,11 +944,11 @@ class DexHandManipBiHEnv(VecTask):
 
             rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(current_asset)
             for element in rigid_shape_props_asset:
-                element.friction = 2.0  # * We increase the friction coefficient to compensate for missing skin deformation friction in simulation. See the Appx for details.
-                element.rolling_friction = 0.05
-                element.torsion_friction = 0.05
+                element.friction = demo["object_friction"][i] if spider else 2.0
+                element.rolling_friction = demo["object_rolling_friction"][i] if spider else 0.05
+                element.torsion_friction = demo["object_torsion_friction"][i] if spider else 0.05
             self.gym.set_asset_rigid_shape_properties(current_asset, rigid_shape_props_asset)
-            self.objs_assets[obj_id] = current_asset
+            self.objs_assets[asset_key] = current_asset
 
         # * load assigned scale and mass for the object if available
         if obj_id in oakink2_obj_scale:
@@ -865,6 +960,9 @@ class DexHandManipBiHEnv(VecTask):
             mass = oakink2_obj_mass[obj_id]
         else:
             mass = None
+        if spider:
+            scale = demo["object_scale"][i]
+            mass = demo["object_mass_override"][i]
 
         sum_rigid_body_count = self.gym.get_asset_rigid_body_count(current_asset)
         sum_rigid_shape_count = self.gym.get_asset_rigid_shape_count(current_asset)
@@ -879,16 +977,18 @@ class DexHandManipBiHEnv(VecTask):
 
         pose = gymapi.Transform()
         pose.p = gymapi.Vec3(obj_transf[0, 3], obj_transf[1, 3], obj_transf[2, 3])
-        obj_aa = rotmat_to_aa(obj_transf[:3, :3])
-        obj_aa_angle = torch.norm(obj_aa)
-        obj_aa_axis = obj_aa / obj_aa_angle
-        pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(obj_aa_axis[0], obj_aa_axis[1], obj_aa_axis[2]), obj_aa_angle)
+        obj_quat = rotmat_to_quat(obj_transf[:3, :3])
+        pose.r = gymapi.Quat(*[float(v) for v in obj_quat[[1, 2, 3, 0]]])
 
         # ? object actor filter bit is always 1
         if side == "rh":
             obj_actor = self.gym.create_actor(env_ptr, current_asset, pose, "manip_obj_rh", i, 0)
         else:
             obj_actor = self.gym.create_actor(env_ptr, current_asset, pose, "manip_obj_lh", i, 0)
+        self._set_actor_color(
+            env_ptr, obj_actor,
+            self.visualization.tool_color if side == "rh" else self.visualization.object_color,
+        )
         obj_index = self.gym.get_actor_index(env_ptr, obj_actor, gymapi.DOMAIN_SIM)
 
         if side == "rh":
@@ -961,7 +1061,7 @@ class DexHandManipBiHEnv(VecTask):
             self.gym.set_rigid_body_color(env_ptr, a, 0, gymapi.MESH_VISUAL, c)
 
         # * just for visualization purposes, add a small sphere at the finger positions
-        if not self.headless:
+        if self.show_reference_skeleton:
             dexhand_template = self.dexhand_rh if side == "rh" else self.dexhand_lh
             for joint_vis_id, joint_name in enumerate(dexhand_template.body_names):
                 joint_name = dexhand_template.to_hand(joint_name)[0]
@@ -1099,7 +1199,7 @@ class DexHandManipBiHEnv(VecTask):
         side_demo_data = self.demo_data_rh if side == "rh" else self.demo_data_lh
         target_state = {}
         max_length = torch.clip(side_demo_data["seq_len"], 0, self.max_episode_length).float()
-        cur_idx = self.progress_buf
+        cur_idx = torch.minimum(self.progress_buf, side_demo_data["seq_len"] - 1)
         cur_wrist_pos = side_demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
         target_state["wrist_pos"] = cur_wrist_pos
         cur_wrist_rot = side_demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
@@ -1196,7 +1296,8 @@ class DexHandManipBiHEnv(VecTask):
         assert not self.headless or isinstance(compute_imitation_reward, torch.jit.ScriptFunction)
 
         if self.rollout_len is not None:
-            max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
+            margin = 0 if self.reference_source == "spider" else 3
+            max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + margin + 1)
 
         (
             rew_buf,
@@ -1219,6 +1320,7 @@ class DexHandManipBiHEnv(VecTask):
             max_length,
             scale_factor,
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
+            0 if self.reference_source == "spider" else 3,
         )
         self.total_rew_buf += rew_buf
         return (
@@ -1300,6 +1402,7 @@ class DexHandManipBiHEnv(VecTask):
         cur_idx = torch.stack(
             [cur_idx + t for t in range(self.obs_future_length)], dim=-1
         )  # [B, K], K = obs_future_length
+        cur_idx = torch.minimum(cur_idx, (side_demo_data["seq_len"] - 1)[:, None])
         nE, nT = side_demo_data["wrist_pos"].shape[:2]
         nF = self.obs_future_length
 
@@ -1639,49 +1742,63 @@ class DexHandManipBiHEnv(VecTask):
         }
         return obs, rew, done, info
 
-    def pre_physics_step(self, actions):
+    def _set_actor_color(self, env_ptr, actor, color):
+        if color is None or self.graphics_device_id < 0:
+            return
+        if not self.visualization.preserve_textures and self._visualization_white_texture is None:
+            # A neutral texture prevents imported mesh textures from tinting
+            # custom colors. INVALID_HANDLE is not a supported removal API in
+            # this SDK and can produce incorrect camera colors.
+            self._visualization_white_texture = self.gym.create_texture_from_buffer(
+                self.sim, 1, 1, np.full((1, 4), 255, dtype=np.uint8)
+            )
+            if self._visualization_white_texture == gymapi.INVALID_HANDLE:
+                raise RuntimeError("Failed to create the neutral visualization texture")
+        for body_index in range(self.gym.get_actor_rigid_body_count(env_ptr, actor)):
+            if not self.visualization.preserve_textures:
+                self.gym.set_rigid_body_texture(
+                    env_ptr, actor, body_index, gymapi.MESH_VISUAL, self._visualization_white_texture
+                )
+            self.gym.set_rigid_body_color(env_ptr, actor, body_index, gymapi.MESH_VISUAL, gymapi.Vec3(*color))
 
-        # ? >>> for visualization
-        if not self.headless:
+    def _update_visualization(self):
+        if self.headless:
+            return
 
-            cur_idx = self.progress_buf
-
-            self.gym.clear_lines(self.viewer)
-
-            def set_side_joint(cur_idx, side="rh"):
-                cur_wrist_pos = getattr(self, f"demo_data_{side}")["wrist_pos"][torch.arange(self.num_envs), cur_idx]
-                cur_mano_joint_pos = getattr(self, f"demo_data_{side}")["mano_joints"][
-                    torch.arange(self.num_envs), cur_idx
-                ].reshape(self.num_envs, -1, 3)
-                cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
-                for k in range(len(getattr(self, f"mano_joint_{side}_points"))):
-                    getattr(self, f"mano_joint_{side}_points")[k][:, :3] = cur_mano_joint_pos[:, k]
+        # Contact highlighting is independent of the reference skeleton.
+        if self.visualization.show_contact_highlight:
+            for side in ("lh", "rh"):
+                hand = getattr(self, f"dexhand_{side}")
+                handles = getattr(self, f"dexhand_{side}_handles")
                 for env_id, env_ptr in enumerate(self.envs):
-                    for rh_k, k in zip(
-                        self.dexhand_rh.body_names,
-                        (self.dexhand_rh.body_names if side == "rh" else self.dexhand_lh.body_names),
-                    ):
-                        self.set_force_vis(
-                            env_ptr,
-                            rh_k,
-                            torch.norm(self.net_cf[env_id, getattr(self, f"dexhand_{side}_handles")[k]], dim=-1) != 0,
-                            side,
-                        )
+                    for name in hand.body_names:
+                        has_force = torch.norm(self.net_cf[env_id, handles[name]], dim=-1) != 0
+                        self.set_force_vis(env_ptr, name, has_force, side)
 
-                    def add_lines(viewer, env_ptr, hand_joints, color):
-                        assert hand_joints.shape[0] == self.dexhand_rh.n_bodies and hand_joints.shape[1] == 3
-                        hand_joints = hand_joints.cpu().numpy()
-                        lines = np.array([[hand_joints[b[0]], hand_joints[b[1]]] for b in self.dexhand_rh.bone_links])
-                        for line in lines:
-                            self.gym.add_lines(viewer, env_ptr, 1, line, color)
+        if not self.show_reference_skeleton:
+            return
 
-                    color = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
-                    add_lines(self.viewer, env_ptr, cur_mano_joint_pos[env_id].cpu(), color)
+        self.gym.clear_lines(self.viewer)
+        color = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
+        for side in ("lh", "rh"):
+            hand = getattr(self, f"dexhand_{side}")
+            demo = getattr(self, f"demo_data_{side}")
+            cur_idx = torch.minimum(self.progress_buf, demo["seq_len"] - 1)
+            env_ids = torch.arange(self.num_envs, device=cur_idx.device)
+            wrist_pos = demo["wrist_pos"][env_ids, cur_idx]
+            joint_pos = demo["mano_joints"][env_ids, cur_idx].reshape(self.num_envs, -1, 3)
+            joint_pos = torch.cat([wrist_pos[:, None], joint_pos], dim=1)
+            for k, point in enumerate(getattr(self, f"mano_joint_{side}_points")):
+                point[:, :3] = joint_pos[:, k]
+            for env_id, env_ptr in enumerate(self.envs):
+                hand_joints = joint_pos[env_id].cpu().numpy()
+                assert hand_joints.shape == (hand.n_bodies, 3)
+                for start, end in hand.bone_links:
+                    line = np.array([hand_joints[start], hand_joints[end]])
+                    self.gym.add_lines(self.viewer, env_ptr, 1, line, color)
 
-            set_side_joint(cur_idx, "lh")
-            set_side_joint(cur_idx, "rh")
-
-        # ? <<< for visualization
+    def pre_physics_step(self, actions):
+        self._update_visualization()
 
         root_control_dim = 9 if self.use_pid_control else 6
         res_split_idx = (
@@ -1958,7 +2075,7 @@ class DexHandManipBiHEnv(VecTask):
         self.gym.set_rigid_body_color(
             env_ptr,
             self.gym.find_actor_handle(env_ptr, "dexhand_l" if side == "lh" else "dexhand_r"),
-            getattr(self, f"dexhand_rh_handles")[part_k],  # tricks here, because the handle is the same
+            self._hand_visual_body_indices[side][part_k],
             gymapi.MESH_VISUAL,
             (
                 gymapi.Vec3(
@@ -1967,7 +2084,7 @@ class DexHandManipBiHEnv(VecTask):
                     0.6,
                 )
                 if has_force
-                else gymapi.Vec3(1.0, 1.0, 1.0)
+                else gymapi.Vec3(*(self.visualization.hand_color(side) or (1.0, 1.0, 1.0)))
             ),
         )
 
@@ -2007,6 +2124,7 @@ def compute_imitation_reward(
     max_length: List[int],
     scale_factor: float,
     dexhand_weight_idx: Dict[str, List[int]],
+    terminal_margin: int = 3,
 ) -> Tuple[
     Tensor,
     Tensor,
@@ -2020,7 +2138,7 @@ def compute_imitation_reward(
     Tensor,
 ]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Tensor, Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float, Dict[str, List[int]], int) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Tensor, Tensor, Tensor, Tensor]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -2175,8 +2293,8 @@ def compute_imitation_reward(
     )
 
     succeeded = (
-        progress_buf + 1 + 3 >= max_length
-    ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
+        progress_buf + 1 + terminal_margin >= max_length
+    ) & ~failed_execute  # legacy margin stays 3; SPIDER includes the real last frame
     reset_buf = torch.where(
         succeeded | failed_execute,
         torch.ones_like(reset_buf),

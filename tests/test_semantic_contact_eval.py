@@ -573,7 +573,7 @@ class SemanticContactEvalTests(unittest.TestCase):
             self.assertTrue(torch.equal(env.demo_data_rh["tips_distance"], reference))
 
     def test_player_logs_original_prefix_batch_and_cumulative(self):
-        run = extract_method("lib/rl/player.py", "MyBasePlayer", "run")
+        run = extract_method("lib/rl/player.py", "MyBasePlayer", "_run")
         stats = accumulator((2, 2))
         for t in range(3):
             stats.record(torch.tensor([t, t]), torch.tensor([32, 0]), torch.tensor([0, 0]))

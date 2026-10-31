@@ -64,6 +64,7 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
         env,
         n_parallel_recorders: int = 1,
         n_successful_videos_to_record: int = 50,
+        stop_after_videos: bool = True,
     ):
         super().__init__(env)
         n_parallel_recorders = min(n_parallel_recorders, env.num_envs)
@@ -75,6 +76,7 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
         self._n_video_saved = 0
         self._n_successful_video_saved = 0
         self._n_successful_videos_to_record = n_successful_videos_to_record
+        self._stop_after_videos = stop_after_videos
 
     def reset(self, **kwargs):
         self._videos = [[] for _ in range(self._n_recorders)]
@@ -82,6 +84,8 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, done, info = super().step(action)
+        if not self._stop_after_videos and self._n_successful_video_saved >= self._n_successful_videos_to_record:
+            return obs, reward, done, info
         for i, idx in enumerate(self._rcd_idxs):
             self._videos[i].append(self.env.camera_obs[idx].clone())
         if torch.any(done):
@@ -103,5 +107,8 @@ class WandbVideoCaptureWrapper(gym.Wrapper):
                     self._n_video_saved += 1
                     self._videos[i] = []
                     if self._n_successful_video_saved >= self._n_successful_videos_to_record:
-                        exit()
+                        if self._stop_after_videos:
+                            exit()
+                        self._videos = [[] for _ in range(self._n_recorders)]
+                        return obs, reward, done, info
         return obs, reward, done, info

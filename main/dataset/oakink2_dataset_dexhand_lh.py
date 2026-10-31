@@ -48,7 +48,8 @@ class OakInk2DatasetDexHandLH(ManipData):
             **kwargs,
         )
 
-        pathes = os.listdir(os.path.join(data_dir, "anno_preview"))
+        pathes = [name for name in os.listdir(os.path.join(data_dir, "anno_preview"))
+                  if name.endswith(".pkl") and not name.startswith(".")]
         pathes = [os.path.join(data_dir, "anno_preview", p) for p in pathes]
         pathes.sort(key=lambda x: x.split("/")[-1])
         self.data_pathes = pathes
@@ -182,8 +183,8 @@ class OakInk2DatasetDexHandLH(ManipData):
             np.repeat(mano_rot_offset[None], smplx_results.transform_abs.shape[0], axis=0), device=self.device
         )
 
-        obj_mesh = load_obj_map(os.path.join(self.data_dir, "object_preview", "align_ds"), object_list)
         obj_id = program_info_selected["obj_list_lh"][0]
+        obj_mesh = load_obj_map(os.path.join(self.data_dir, "object_preview", "align_ds"), [obj_id])
         obj_mesh_trimesh = obj_mesh[program_info_selected["obj_list_lh"][0]][0]
         obj_mesh_path = obj_mesh[program_info_selected["obj_list_lh"][0]][1]
 
