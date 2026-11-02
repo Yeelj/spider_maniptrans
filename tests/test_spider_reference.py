@@ -9,11 +9,12 @@ from types import SimpleNamespace
 import unittest
 
 import numpy as np
+from omegaconf import OmegaConf
 import torch
 
 from lib.utils.spider_reference import (
     find_manifest, name_order, normalize_tool, object_transform,
-    read_bundle, resolve_asset, sha256, validate_bundle,
+    prepare_training_config, read_bundle, resolve_asset, sha256, validate_bundle,
 )
 
 
@@ -149,6 +150,55 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(resolve_asset("/old/data/tool.ply", root / "manifest.json", path_map={"/old/data": directory}), str(root / "tool.ply"))
             with self.assertRaises(FileNotFoundError):
                 resolve_asset("/wrong/tool.ply", root / "manifest.json")
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        task = root / "045/TACO/training/test_task"
+        task.mkdir(parents=True)
+        manifest, arrays = fixture()
+        manifest.update(state_source="spider_execution", failed_at=None, failure_reason=None)
+        np.savez(str(task / "trajectory.npz"), **arrays)
+        manifest["trajectory_sha256"] = sha256(task / "trajectory.npz")
+        (task / "manifest.json").write_text(json.dumps(manifest))
+        policy = root / "base.pth"
+        policy.touch()
+        self.cfg = OmegaConf.create({
+            "test": False, "side": "BiH", "bimanual_mode": "united", "dexhand": "artimano",
+            "rh_base_model_checkpoint": str(policy), "lh_base_model_checkpoint": str(policy),
+            "task": {"name": "ResDexHandBiH", "sim": {"dt": 1 / 60}, "env": {
+                "referenceSource": "spider", "datasetType": "spider", "obsFutureLength": 1,
+                "objectReference": "demonstration", "referenceRoot": str(root),
+                "referenceDataset": "TACO", "newObj": "045", "assetRoot": None,
+                "assetPathMap": {}, "allowFailedReference": True, "episodeLength": 4,
+                "dataIndices": ["test_task"], "numEnvs": 4,
+            }},
+            "rl_train": {"params": {"config": {"horizon_length": 32, "minibatch_size": 1024}}},
+        })
+
+    def test_inference_with_four_envs_accepts_training_minibatch_defaults(self):
+        self.cfg.test = True
+        reports = prepare_training_config(self.cfg)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["task"], "test_task")
+        self.assertEqual(reports[0]["frames"], 4)
+
+    def test_training_rejects_indivisible_minibatch(self):
+        with self.assertRaisesRegex(ValueError, "num_envs \\* horizon_length must be divisible"):
+            prepare_training_config(self.cfg)
+
+    def test_training_accepts_divisible_minibatch(self):
+        self.cfg.rl_train.params.config.minibatch_size = 128
+        self.assertEqual(len(prepare_training_config(self.cfg)), 1)
+
+    def test_inference_still_rejects_truncated_reference(self):
+        self.cfg.test = True
+        self.cfg.task.env.episodeLength = 3
+        with self.assertRaisesRegex(ValueError, "would truncate 4 frames"):
+            prepare_training_config(self.cfg)
 
 
 class PackingTests(unittest.TestCase):

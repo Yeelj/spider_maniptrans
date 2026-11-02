@@ -180,6 +180,39 @@ CUDA_VISIBLE_DEVICES=0 "$SPIDER_TRAIN_ENV/bin/python" -m main.rl.train \
   experiment=SPIDER_OakInk_9b728@0_spoon@1_artimano
 
 
+# test
+
+# OakInk-v2
+python -m main.rl.train \
+  task=ResDexHand side=BiH bimanual_mode=united dexhand=artimano \
+  test=true headless=false num_envs=4 test_episodes=120 \
+  randomStateInit=false rolloutStateInit=false \
+  'dataIndices=[9b728@0]' \
+  task.env.referenceSource=spider task.env.datasetType=spider \
+  task.env.referenceRoot=data/retargeting_spider_native \
+  task.env.referenceDataset=OakInk-v2 task.env.newObj=spoon@1 \
+  task.env.objectReference=demonstration task.env.allowFailedReference=true \
+  task.env.episodeLength=1500 task.task.randomize=false \
+  rh_base_model_checkpoint=assets/imitator_rh_artimano.pth \
+  lh_base_model_checkpoint=assets/imitator_lh_artimano.pth \
+  checkpoint=runs/SPIDER_OakInk_9b728@0_spoon@1_artimano__10-26-19-08-20/nn/last_SPIDER_OakInk_9b728@0_spoon@1_artimano_ep_10000_rew__8167.7_.pth \
+  experiment=test_oakink_9b728_spoon1 task.env.semanticContactEval.enabled=true
+
+# TACO
+python -m main.rl.train \
+  task=ResDexHand side=BiH bimanual_mode=united dexhand=artimano \
+  test=true headless=false num_envs=4 test_episodes=120 \
+  randomStateInit=false rolloutStateInit=false \
+  'dataIndices=[sk_box_1104218]' \
+  task.env.referenceSource=spider task.env.datasetType=spider \
+  task.env.referenceRoot=data/retargeting_spider_native \
+  task.env.referenceDataset=TACO task.env.newObj=045 \
+  task.env.objectReference=demonstration task.env.allowFailedReference=true \
+  task.env.episodeLength=1500 task.task.randomize=false \
+  rh_base_model_checkpoint=assets/imitator_rh_artimano.pth \
+  lh_base_model_checkpoint=assets/imitator_lh_artimano.pth \
+  checkpoint=runs/SPIDER_Taco_sk_box_1104218_045_artimano__10-23-10-13-30/nn/last_SPIDER_Taco_sk_box_1104218_045_artimano_ep_10000_rew__141.53_.pth \
+  experiment=test_taco_sk_box_045 task.env.semanticContactEval.enabled=true
 
 ```
 

@@ -35,6 +35,11 @@ python main/rl/train.py task=ResDexHand side=BiH dexhand=artimano \
 ```
 
 `dexhand`、网络配置、基础策略 checkpoint、PID、动作平滑等必须使用该 checkpoint 训练时的配置；示例值不能用于替代实际训练配置。
+SPIDER 的 `test=true` 模式不执行 PPO 更新，无需让 `num_envs * horizon_length`
+被 `minibatch_size` 整除；该校验仅用于 `test=false` 的训练。
+旧代码若在四环境测试时报此错误，可临时追加
+`rl_train.params.config.minibatch_size=128`（默认 `horizon_length=32`），
+更新代码后无需此参数。它不改变测试时的策略动作或语义指标。
 如需替换工具，使用 `new_obj` 替换 TACO 或 OakInk-V2 的右手工具，并选择对应数据；OakInk-V2 使用原生物体 ID（例如 `new_obj=O02@0015@00004`）。
 对比方法仍通过原数据加载器读取 `data/retargeting` 中 checkpoint 训练时的原始参考。
 公共修正 PKL 仅可提供评估标注，里面的腕部、手指和物体轨迹不会进入策略。
@@ -58,6 +63,25 @@ semanticContactEval:
 使用 `new_obj` 时，映射仍以数据 ID 为键，但必须指向替换后的工具标注。
 红黑点集分别按顶点顺序用 `linspace` 确定性取 512 点，与共同 PhysGraph 数据语义点集的采样规则一致。
 比较时要固定同一工具标注及采样规则，不可混用顶点点集、面中心点集或软语义特征。
+
+SPIDER 模式还会按 manifest 校验物理网格的 SHA256。直接在该 PLY 上添加语义颜色，
+或因颜色边界拆分顶点，即使三角形表面不变，也会触发
+`SPIDER asset checksum differs: obj_mesh`。此时应恢复与 manifest 哈希一致的物理网格，
+通过 `assetPathMap` 显式重映射，并通过 `semanticMeshPaths` 单独读取标注副本。
+恢复后需核对两份网格的三角形坐标、单位、原点和方向；不要只修改 manifest 的哈希来消除报错。
+
+本机 `sk_box_1104218` / `045` 的物理网格已从 `object_models_released/045_cm.obj`
+按原流程缩放为米并恢复到 `data/spider_physical_assets/TACO/045/045.ply`，
+SHA256 与原 manifest 完全一致。现有红黑标注在颜色边界拆分了顶点，但全部 42652 个
+三角形坐标与恢复网格逐项相同；记录见同目录的 `restore_report.json`。
+从仓库根目录执行测试时，在原有命令末尾追加以下两项，保留语义评估开关：
+
+```bash
+  '+task.env.assetPathMap={/home/user/ylj/spider_repro/spider/data/TACO/object_models/045:data/spider_physical_assets/TACO/045}' \
+  '+task.env.semanticContactEval.semanticMeshPaths={sk_box_1104218:data/TACO/object_models/045/045.ply}'
+```
+
+这里的 `+` 用于向默认空字典添加映射项。
 
 ## 片段、采集时序与事件
 

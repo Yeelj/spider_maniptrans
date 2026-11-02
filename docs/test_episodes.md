@@ -1,5 +1,8 @@
 # 固定数量的测试 episode
 
+批量按 ID 文件依次评测同一个 checkpoint，并将每条最佳日志的三项指标导出到 Excel，
+见 [批量评测与 Excel 导出](batch_semantic_contact_evaluation.md)。
+
 在原有能够恢复 checkpoint 的 test 命令末尾追加：
 
 ```bash

@@ -221,7 +221,9 @@ def prepare_training_config(cfg):
                         "assets": {side: manifest[side] for side in ("rh", "lh")}})
     if not reports:
         raise ValueError("SPIDER training requires at least one dataIndices task")
-    batch = int(env.numEnvs) * int(cfg.rl_train.params.config.horizon_length)
-    if batch % int(cfg.rl_train.params.config.minibatch_size):
-        raise ValueError("num_envs * horizon_length must be divisible by minibatch_size")
+    # Inference uses the player without PPO minibatch updates.
+    if not cfg.test:
+        batch = int(env.numEnvs) * int(cfg.rl_train.params.config.horizon_length)
+        if batch % int(cfg.rl_train.params.config.minibatch_size):
+            raise ValueError("num_envs * horizon_length must be divisible by minibatch_size")
     return reports

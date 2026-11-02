@@ -190,6 +190,7 @@ test*.py
 !tests/test_visualization.py
 !tests/test_retarget_visualization.py
 !tests/test_episode_statistics.py
+!tests/test_batch_semantic_contact_eval.py
 annotator*.py
 make*.py
 
