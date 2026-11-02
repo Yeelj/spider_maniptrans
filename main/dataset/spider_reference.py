@@ -69,8 +69,18 @@ class SpiderReference(ManipData):
         paths = {key: resolve_asset(info[key], path, self.asset_root, self.asset_path_map)
                  for key in ("obj_mesh_path", "obj_urdf_path")}
         for key in ("obj_mesh", "obj_urdf"):
-            if sha256(paths[key + "_path"]) != info[key + "_sha256"]:
-                raise ValueError("SPIDER asset checksum differs: " + key)
+            actual_sha256 = sha256(paths[key + "_path"])
+            if actual_sha256 != info[key + "_sha256"]:
+                raise ValueError(
+                    "SPIDER asset checksum differs: {} (task={}, side={})\n"
+                    "Asset: {}\nManifest: {}\nExpected SHA256: {}\nActual SHA256: {}\n"
+                    "Restore the exported physical asset using task.env.assetPathMap; "
+                    "read semantic labels separately using "
+                    "task.env.semanticContactEval.semanticMeshPaths.".format(
+                        key, task, side, paths[key + "_path"], path,
+                        info[key + "_sha256"], actual_sha256,
+                    )
+                )
 
         def tensor(value):
             return torch.tensor(np.asarray(value).copy(), dtype=torch.float32, device=self.device)

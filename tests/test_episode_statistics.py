@@ -45,7 +45,8 @@ def snapshot(env_ids, overrides=None):
     return result
 
 
-def player(directory, limit, num_envs=4, semantics=True, episode_length=1, save_rollouts=False):
+def player(directory, limit, num_envs=4, semantics=True, episode_length=1, save_rollouts=False,
+           task_metrics=True):
     env = SimpleNamespace(num_envs=num_envs, success_buf=torch.ones(num_envs, dtype=torch.bool),
                           dump_fileds={"state": torch.zeros(num_envs, 1)})
     calls = {"steps": 0, "resets": 0}
@@ -59,6 +60,10 @@ def player(directory, limit, num_envs=4, semantics=True, episode_length=1, save_
         env.dump_fileds = {"state": torch.full((num_envs, 1), float(calls["steps"]))}
         done = torch.full((num_envs,), calls["steps"] % episode_length == 0, dtype=torch.bool)
         info = {}
+        if task_metrics:
+            errors = torch.arange(1., num_envs + 1)
+            info["diff_metrics"] = {"diff_obj_pos": errors, "diff_joints": errors + 10,
+                                    "diff_ft": errors + 20, "diff_obj_rot": errors + 90}
         if semantics and done.any():
             # Snapshot row order must never be assumed to equal environment ID.
             info["semantic_contact_eval"] = snapshot(list(reversed(range(num_envs))))
@@ -160,7 +165,42 @@ class EpisodeStatisticsTests(unittest.TestCase):
             records, summary = read_results(directory)
             self.assertEqual(summary["best_episode"], records[0])
             self.assertIsNone(summary["semantic_contact"])
+            self.assertIsNone(summary["task_metrics"])
             self.assertEqual(output.getvalue().splitlines()[-1], "[best_steps] " + records[0]["log"])
+
+    def test_invalid_terminal_metrics_preserve_only_previously_completed_episodes(self):
+        for field, invalid in (("diff_obj_pos", float("nan")), ("diff_ft", -1.), ("success", 2.)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                metrics = {name: torch.tensor([1.]) for name in ("diff_obj_pos", "diff_joints", "diff_ft")}
+                success = torch.tensor([1.])
+                with self.assertRaisesRegex(ValueError, "Invalid terminal task metric"):
+                    with EpisodeStatistics(2, directory, False) as stats:
+                        stats.add_batch(torch.tensor([0]), torch.ones(1), torch.ones(1),
+                                        success_buf=success, diff_metrics=metrics)
+                        if field == "success":
+                            success[0] = invalid
+                        else:
+                            metrics[field][0] = invalid
+                        stats.add_batch(torch.tensor([0]), torch.ones(1), torch.ones(1),
+                                        success_buf=success, diff_metrics=metrics)
+                records, summary = read_results(directory)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(summary["status"], "incomplete")
+                self.assertEqual(summary["task_metrics"], dict(episodes=1, successes=1, SR=1.,
+                                                              E_t=1., E_j=1., E_ft=1., error_unit="cm"))
+
+    def test_task_metric_availability_cannot_change_mid_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "Task metric availability changed"):
+                with EpisodeStatistics(2, directory, False) as stats:
+                    stats.add_batch(torch.tensor([0]), torch.ones(1), torch.ones(1),
+                                    success_buf=torch.ones(1),
+                                    diff_metrics={name: torch.ones(1) for name in
+                                                  ("diff_obj_pos", "diff_joints", "diff_ft")})
+                    stats.add_batch(torch.tensor([0]), torch.ones(1), torch.ones(1))
+            records, summary = read_results(directory)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(summary["task_metrics"]["episodes"], 1)
 
     def test_bad_snapshot_is_rejected_and_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -199,6 +239,11 @@ class PlayerIntegrationTests(unittest.TestCase):
             self.assertEqual(summary["completed_episodes"], 100)
             self.assertEqual(summary["mean_reward"], 2.5)
             self.assertEqual(summary["best_episode"]["episode"], 1)
+            self.assertEqual(summary["task_metrics"], dict(episodes=100, successes=100, SR=1.,
+                                                          E_t=2.5, E_j=12.5, E_ft=22.5, error_unit="cm"))
+            self.assertEqual(output.getvalue().splitlines()[-1],
+                             "[test_task_summary] episodes: 100 SR: 1.0000 E_t: 2.5000 "
+                             "E_j: 12.5000 E_ft: 22.5000 error_unit: cm")
 
     def test_partial_last_batch_does_not_pollute_best_or_semantic_totals(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -209,6 +254,9 @@ class PlayerIntegrationTests(unittest.TestCase):
                 if calls["steps"] == 2:
                     info["total_steps"] = torch.tensor([1., 999., 999., 999.])
                     info["semantic_contact_eval"]["semantic_success"][:3] = False
+                    env.success_buf[:] = False
+                    for values in info["diff_metrics"].values():
+                        values[1:] = float("nan")
                 return obs, rewards, done, info
             p.env_step = step
             with redirect_stdout(StringIO()):
@@ -220,6 +268,75 @@ class PlayerIntegrationTests(unittest.TestCase):
             self.assertEqual(summary["semantic_contact"]["episodes"], 5)
             self.assertEqual(summary["semantic_contact"]["semantic_sr_total"], 1)
             self.assertEqual(summary["semantic_contact"]["eval_frames"], 10)
+            self.assertEqual(summary["task_metrics"], dict(episodes=5, successes=4, SR=.8,
+                                                          E_t=2.2, E_j=12.2, E_ft=22.2, error_unit="cm"))
+
+    def test_terminal_metrics_do_not_change_episode_logs_or_semantic_selection(self):
+        # Unequal batch sizes and lengths distinguish per-episode terminal means from
+        # batch means, trajectory means, or success-only means. Non-counted values are NaN.
+        for semantics in (False, True):
+            results = []
+            for enabled in (False, True):
+                with self.subTest(semantics=semantics, enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                    p, calls = player(directory, 5, num_envs=3, semantics=semantics)
+                    batches = iter([
+                        ([False, True, False], [False, False, False], [float("nan"), 2., float("nan")]),
+                        ([True, False, True], [True, False, True], [4., float("nan"), 8.]),
+                        ([False, True, False], [False, True, False], [float("nan"), 16., float("nan")]),
+                        ([True, True, True], [False, True, True], [32., float("nan"), float("nan")]),
+                    ])
+                    buffers = {}
+                    def reset_done():
+                        env = p.env
+                        env.success_buf.zero_()
+                        for values in buffers.values():
+                            values.fill_(999.)
+                        return torch.zeros(3, 1), None
+                    p.env.reset_done = reset_done
+                    def step(env, actions):
+                        calls["steps"] += 1
+                        ended, success, errors = next(batches)
+                        done = torch.tensor(ended)
+                        env.success_buf[:] = torch.tensor(success)
+                        errors = torch.tensor(errors)
+                        buffers.update(diff_obj_pos=errors, diff_joints=errors * 10, diff_ft=errors * 100)
+                        info = {"diff_metrics": buffers} if enabled else {}
+                        if semantics:
+                            info["semantic_contact_eval"] = snapshot([i for i in (2, 1, 0) if ended[i]])
+                        return torch.zeros(3, 1), torch.ones(3), done, info
+                    p.env_step = step
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        p.run()
+                    records, summary = read_results(directory)
+                    task = summary.pop("task_metrics")
+                    results.append((records, summary, (Path(directory) / "episodes.log").read_text()))
+                    self.assertEqual(calls["steps"], 4)
+                    if enabled:
+                        self.assertEqual(task, dict(episodes=5, successes=3, SR=.6,
+                                                    E_t=12.4, E_j=124., E_ft=1240., error_unit="cm"))
+                        self.assertEqual(output.getvalue().count("[test_task_summary]"), 1)
+                    else:
+                        self.assertIsNone(task)
+                        self.assertNotIn("[test_task_summary]", output.getvalue())
+                    if semantics:
+                        self.assertEqual(summary["semantic_contact"]["semantic_sr_total"], 1.)
+                    for record in records:
+                        self.assertTrue(all(name not in record and name + ":" not in record["log"]
+                                            for name in ("SR", "E_t", "E_j", "E_ft")))
+            self.assertEqual(results[0], results[1])
+
+    def test_limit_smaller_than_num_envs_and_all_task_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p, calls = player(directory, 1, num_envs=4, semantics=False)
+            p.env.success_buf.zero_()
+            with redirect_stdout(StringIO()):
+                p.run()
+            records, summary = read_results(directory)
+            self.assertEqual(calls["steps"], 1)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(summary["task_metrics"], dict(episodes=1, successes=0, SR=0.,
+                                                          E_t=1., E_j=11., E_ft=21., error_unit="cm"))
 
     def test_custom_limit_single_env_and_no_semantics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -234,6 +351,8 @@ class PlayerIntegrationTests(unittest.TestCase):
             self.assertEqual([r["reward"] for r in records], [2., 2., 2.])
             self.assertEqual(summary["best_episode"]["episode"], 1)
             self.assertEqual(output.getvalue(), "")
+            self.assertEqual(summary["task_metrics"], dict(episodes=3, successes=3, SR=1.,
+                                                          E_t=1., E_j=11., E_ft=21., error_unit="cm"))
 
     def test_asynchronous_endings_preserve_reward_steps_and_rnn_resets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -283,6 +402,8 @@ class PlayerIntegrationTests(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(summary["status"], "incomplete")
             self.assertEqual(summary["stop_reason"], "KeyboardInterrupt")
+            self.assertEqual(summary["task_metrics"]["episodes"], 1)
+            self.assertEqual(summary["task_metrics"]["E_t"], 1.)
             self.assertFalse(p.h5py_file.id.valid)
 
     def test_final_rollout_is_saved_without_extra_step(self):

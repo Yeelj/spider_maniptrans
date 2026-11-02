@@ -1,6 +1,6 @@
 # 固定数量的测试 episode
 
-批量按 ID 文件依次评测同一个 checkpoint，并将每条最佳日志的三项指标导出到 Excel，
+批量按 ID 文件依次评测同一个 checkpoint，并将每条最佳日志的三项语义指标及全回合 SR、E_t、E_j、E_ft 汇总导出到 Excel，
 见 [批量评测与 Excel 导出](batch_semantic_contact_evaluation.md)。
 
 在原有能够恢复 checkpoint 的 test 命令末尾追加：
@@ -38,13 +38,30 @@ task.env.semanticContactEval.enabled=true
 
 - `episodes.log`：每个 episode 一行的完整文本日志。
 - `episodes.jsonl`：每个 episode 一条结构化数据，包括原始数值、完整日志和可用的语义计数。
-- `summary.json`：目标/完成数量、运行状态、平均 reward/steps、最大 steps、最佳记录和语义总统计。
+- `summary.json`：目标/完成数量、运行状态、平均 reward/steps、最大 steps、最佳记录、语义总统计和独立的 `task_metrics` 汇总。
 
 现有 `config.yaml`、`spider_references.json` 保存方式不变。日志逐条刷盘；已有同名 episode 日志不会被覆盖。
-结束后先打印 `[test_summary]`，如有语义指标再打印 `[test_semantic_summary]`，最后打印 `[best_steps]` 和最佳记录的完整原始日志。
+结束后先打印 `[test_summary]`，如有语义指标再打印 `[test_semantic_summary]`，再打印 `[best_steps]` 和最佳记录的完整原始日志。
 最佳记录的 `semantic_sr_total` 是记录该 episode 时的累计值；最终累计值位于总统计中。
 总统计按原始事件数、帧数加权，不直接平均各个 episode 的比例。
 若关闭 player 的 `print_stats`，仍保存三个文件，但不打印 episode 或汇总行。
+
+对于提供 `diff_metrics` 的任务（当前双手操作任务），有限次测试最后额外打印一次：
+
+```text
+[test_task_summary] episodes: 120 SR: 0.7500 E_t: 1.2345 E_j: 0.8765 E_ft: 1.1023 error_unit: cm
+```
+
+`SR` 为全部已接受 episode 中 `success_buf=True` 的比例，与语义成功率分别统计。
+`E_t`、`E_j`、`E_ft` 分别复用训练端的 `diff_obj_pos`、`diff_joints`、`diff_ft`，均为 cm，
+双手合并方式保持环境原有定义，不重复换算单位。误差在各 episode 实际终止帧、下一次 reset 前采集，
+与该帧的参考状态比较；成功、失败、提前终止都参与按 episode 等权的均值，不进行逐帧平均或批次平均。
+最后一批超出上限的环境不计入这些统计。这四项只出现在最终汇总中，
+不写入 `episodes.log`、`episodes.jsonl` 或 `best_episode`，也不参与最佳 episode 选择。
+`summary.json.task_metrics` 保存原始精度及 `episodes`、`successes`、`error_unit`；无可用数据时为 `null`。
+中断时按实际已完成数量汇总，并沿用 `status=incomplete`。被接受的终止数据无效时会明确报错，
+保存此前完成部分，不跳过该数据计算均值。未提供 `diff_metrics` 的任务及默认不限回合模式保留原输出。
+训练端统计使用 `games_to_track` 窗口，有限次 test 使用本次全部已接受回合，样本范围不同。
 
 计数与 `save_rollouts` 独立，正常统计不需要保存轨迹。
 同时启用轨迹保存时，目录仍使用原来的 `dump_` 前缀，并保留原有短轨迹过滤、初始化预热跳过和成功轨迹筛选。

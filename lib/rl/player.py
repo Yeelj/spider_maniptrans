@@ -506,7 +506,10 @@ class MyBasePlayer(object):
                 semantic_summary = None
                 snapshot = info.get("semantic_contact_eval")
                 if episode_recorder is not None:
-                    accepted_ids = episode_recorder.add_batch(done_indices, cr, steps, snapshot)
+                    # Read the terminal errors before reset_done() can advance to the next episode.
+                    accepted_ids = episode_recorder.add_batch(
+                        done_indices, cr, steps, snapshot, success_buf=prev_success_buf,
+                        diff_metrics=info.get("diff_metrics"))
                 elif snapshot is not None:
                     from main.semantic_contact_eval import SemanticContactSummary
                     if semantic_totals is None:

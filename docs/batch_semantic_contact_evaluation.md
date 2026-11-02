@@ -31,22 +31,49 @@ python scripts/batch_semantic_contact_eval.py \
   --checkpoint runs/SPIDER_OakInk_9b728@0_spoon@1_artimano__10-26-19-08-20/nn/last_SPIDER_OakInk_9b728@0_spoon@1_artimano_ep_10000_rew__8167.7_.pth \
   --new-obj spoon@1 \
   --reference-dataset OakInk-v2 \
-  --new-oakink /srv/spider_maniptrans/data/OakInk-v2 \
+  --new-data-root /srv/spider_maniptrans/data \
   --output add_data_evaluation/OakInk/spoon1_results.xlsx
 ```
 
-`--new-oakink PATH`（别名 `--new-oakink-root`）为每条命令自动追加
-`+task.env.assetPathMap={旧根目录:PATH}`。旧根目录固定为：
+`--new-data-root PATH`（别名 `--new-data`）统一映射整个 `data` 根目录，
+适用于 `--reference-dataset OakInk-v2` 和 `--reference-dataset TACO`。
+PATH 应指向同时包含 `OakInk-v2/`、`TACO/` 子目录的 `data/`，例如：
 
 ```text
-/media/user/89785a2b-45b3-43b5-99ad-a5558e7ad6484/spider_data/PhysGraph/data/OakInk-v2
+/srv/spider_maniptrans/data/
+  OakInk-v2/
+  TACO/
 ```
 
-目标路径应指向完整 `OakInk-v2` 资产根目录，而非某个工具或训练包目录。
-未传 `--new-oakink` 时不添加这条映射，继续使用 manifest 原有路径；当前 OakInk-v2 包
-即从上述旧目录读取。无需设置 `OLD_OAKINK` 或 `NEW_OAKINK` 环境变量。
-相对目标路径基于项目根目录，支持路径中的空格。
-此映射可与 `--override` 中的其他资产映射合并；相同旧根目录以 `--new-oakink` 为准。
+脚本默认把现有 manifest 中的两个旧 `data` 根目录都映射到 PATH：
+
+```text
+/media/user/89785a2b-45b3-43b5-99ad-a5558e7ad6484/spider_data/PhysGraph/data
+/home/user/ylj/spider_repro/spider/data
+```
+
+因此旧路径下的 `OakInk-v2/...` 和 `TACO/...` 分别保留相同相对路径，落到新 `data/` 下。
+无需修改 manifest。若只迁移本次测试的数据集，可只复制对应的子目录。
+如果目标项目的 `data/` 就是新的资产目录，可直接使用 `--new-data-root data`。
+
+其他来源的参考包可以通过 `--old-data-root` 指定 manifest 记录的旧绝对 `data` 根目录，
+该选项可重复；显式指定后替代上述默认旧根目录。例如，在原批处理命令中追加：
+
+```bash
+  --old-data-root /old/server/project/data \
+  --new-data-root /new/server/project/data
+```
+
+未传任何新根目录选项时不自动添加映射，继续使用 manifest 原有路径。
+相对目标路径基于项目根目录，支持路径中的空格。源路径按 manifest 的字面路径匹配，
+无需在新服务器存在，也不会在新服务器解析旧路径的软链接。
+映射可与 `--override` 中的其他资产映射合并，相同源根目录以命名选项为准；
+更具体的子目录映射由加载器优先匹配。
+物体资产映射与 `--reference-root` 独立，后者仍用于定位 `retargeting_spider_native` 训练包。
+
+保留旧选项 `--new-oakink PATH` / `--new-oakink-root PATH` 的原有含义：
+PATH 是 `OakInk-v2/` 本身，只映射该数据集。它与 `--new-data-root` 互斥，
+统一迁移时请使用新的 `--new-data-root`，无需设置任何旧、新路径环境变量。
 
 `--newObj`、`--referenceDataset` 分别为 `--new-obj`、`--reference-dataset` 的别名。
 TACO 数字物体 ID 自动补齐三位，例如 `45` 保存为文本 `045`；OakInk-v2 使用原生物体 ID。
@@ -71,6 +98,11 @@ task.env.semanticContactEval.enabled=true test_episodes=120
 `--rh-checkpoint PATH`、`--lh-checkpoint PATH` 调整对应参数。
 实验名由脚本自动生成，包含批次唯一标记、行号和数据 ID，避免读取历史或其他进程的日志。
 每条测试的 stdout/stderr 保存至独立的 `process.log`，终端显示命令、日志路径和最终最佳指标。
+每条 ID 完成后，终端还会单独打印一次 `[test_task_summary]`，包含该 ID 全部 N 个回合的 SR
+及三项终止帧误差均值 E_t、E_j、E_ft（cm）；该行也保留在 `process.log` 中。
+原始精度见对应测试目录的 `summary.json.task_metrics`，统计定义见 [固定数量测试说明](test_episodes.md)。
+这些统计不参与最佳 episode 选择，也不修改 `batch_report.json.metrics` 的语义指标。
+Excel 在原有五列后追加这四项指标；兼容没有 `task_metrics` 的旧汇总，此时新增四列填为 `NA`。
 
 资产映射、标注网格、共享时间标记等附加 Hydra 参数通过可重复的 `--override` 传入。
 例如，针对本机 `sk_box_1104218` / `045`，在上述脚本命令末尾追加：
@@ -85,20 +117,22 @@ task.env.semanticContactEval.enabled=true test_episodes=120
 脚本控制的测试模式、episode 上限、ID、checkpoint、物体、数据集、实验名和输出目录等参数不能通过 `--override` 改写。
 追加 `--dry-run` 可只打印所有完整命令，不启动仿真，也不创建或覆盖 Excel 和日志。
 
-Excel 只有以下五列，每条 ID 占一行：
+Excel 包含以下九列，每条 ID 占一行：
 
-| dataIndices | new_obj | operation_completion_ratio | planned_semantic_contact_coverage | black_violation_frame_ratio |
-| --- | --- | --- | --- | --- |
-| sk_box_1104218 | 045 | 0.95 | 0.80 | 0.02 |
+| dataIndices | new_obj | operation_completion_ratio | planned_semantic_contact_coverage | black_violation_frame_ratio | SR | E_t | E_j | E_ft |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sk_box_1104218 | 045 | 0.95 | 0.80 | 0.02 | 0.75 | 1.23 | 0.88 | 1.10 |
 
-上表数值仅为格式示例。三个指标读取自本次评测 `summary.json` 的 `best_episode`，
+上表数值仅为格式示例。前三个语义指标读取自本次评测 `summary.json` 的 `best_episode`，
 对应终端 `[best_steps]` 的完整最佳日志，保留 JSON 原始数值精度。
+新增 `SR`、`E_t`、`E_j`、`E_ft` 读取自同一文件的 `task_metrics`，
+对应该 ID 全部 N 回合的成功率和三项终止帧误差均值，误差单位为 cm；以数值写入 Excel，保留原始精度。
 最佳记录沿用项目现有规则：steps 降序、完成比例降序、计划语义覆盖率降序、黑区违规比例升序；
 完全相同则保留最早 episode。规则详见 [固定数量测试说明](test_episodes.md)。
 Excel 中有效比例为 0–1 数值；原始值 `null` 写为文本 `NA`，物体 ID 保存为文本以保留前导零。
 
 脚本在每条结束后原子更新 `--output` 文件；再次运行会覆盖该文件。
-评测失败、汇总缺失、未完成指定 episode 数或缺少指标时，该行三个指标写为 `ERROR`，
+评测失败、汇总缺失、未完成指定 episode 数、缺少必需语义指标或已有任务汇总无效时，该行七项指标写为 `ERROR`，
 继续运行后续 ID，最终退出码为 1；全部成功为 0，Ctrl+C 中断为 130。
 尚未运行的行指标为空，中断时保留此前结果。
 默认批次日志目录为 `<output文件名去扩展名>_logs/<批次标记>/`，可用 `--logs-dir PATH` 更改父目录。

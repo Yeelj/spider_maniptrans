@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run SPIDER checkpoint tests sequentially and export best-episode metrics to XLSX."""
+"""Run SPIDER checkpoint tests and export semantic and aggregate task metrics to XLSX."""
 
 '''
 python scripts/batch_semantic_contact_eval.py \
@@ -27,16 +27,19 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OLD_OAKINK = (
+DEFAULT_OLD_DATA_ROOTS = (
     "/media/user/89785a2b-45b3-43b5-99ad-a5558e7ad6484/"
-    "spider_data/PhysGraph/data/OakInk-v2"
+    "spider_data/PhysGraph/data",
+    "/home/user/ylj/spider_repro/spider/data",
 )
+OLD_OAKINK = DEFAULT_OLD_DATA_ROOTS[0] + "/OakInk-v2"
 METRICS = (
     "operation_completion_ratio",
     "planned_semantic_contact_coverage",
     "black_violation_frame_ratio",
 )
-COLUMNS = ("dataIndices", "new_obj") + METRICS
+TASK_METRICS = ("SR", "E_t", "E_j", "E_ft")
+COLUMNS = ("dataIndices", "new_obj") + METRICS + TASK_METRICS
 # These options identify the run, guarantee finite semantic evaluation, or locate its logs.
 RESERVED_OVERRIDES = {
     "dataIndices", "checkpoint", "experiment", "test", "test_episodes", "save_rollouts",
@@ -66,15 +69,27 @@ def parse_args(argv=None):
     parser.add_argument("--num-envs", type=positive_int, default=4)
     parser.add_argument("--headless", choices=("true", "false"), default="false")
     parser.add_argument("--reference-root", default="data/retargeting_spider_native")
-    parser.add_argument("--new-oakink", "--new-oakink-root", dest="new_oakink", type=Path,
-                        help="New OakInk-v2 asset root, relative to the project or absolute; "
-                             "omitting this option keeps the original asset paths")
+    mapping = parser.add_mutually_exclusive_group()
+    mapping.add_argument("--new-data-root", "--new-data", dest="new_data_root", type=Path,
+                         help="New data directory containing OakInk-v2/ and TACO/; "
+                              "relative paths are based on the project")
+    parser.add_argument("--old-data-root", dest="old_data_roots", type=Path, action="append",
+                        help="Old absolute data root recorded in manifests; repeatable, "
+                             "defaults to the two data roots used by the existing bundles")
+    mapping.add_argument("--new-oakink", "--new-oakink-root", dest="new_oakink", type=Path,
+                         help="Legacy option mapping only OakInk-v2; "
+                              "use --new-data-root for a shared data directory")
     parser.add_argument("--rh-checkpoint", default="assets/imitator_rh_artimano.pth")
     parser.add_argument("--lh-checkpoint", default="assets/imitator_lh_artimano.pth")
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE",
                         help="Additional Hydra override, repeatable (e.g. semanticMeshPaths or assetPathMap)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without evaluating or writing files")
     args = parser.parse_args(argv)
+    if args.old_data_roots and args.new_data_root is None:
+        parser.error("--old-data-root requires --new-data-root")
+    for old_root in args.old_data_roots or []:
+        if not old_root.expanduser().is_absolute():
+            parser.error("--old-data-root must be an absolute source path from the manifest")
     if args.output.suffix.lower() != ".xlsx":
         parser.error("--output must end in .xlsx")
     if not args.new_obj or args.new_obj in (".", "..") or any(c in args.new_obj for c in "/\\"):
@@ -111,6 +126,11 @@ def hydra_string(value):
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def hydra_dict_key(value):
+    # Hydra dictionary keys use escaped literals rather than quoted strings.
+    return re.sub(r"([\\(){}\[\]:=, \t])", r"\\\1", str(value))
+
+
 def build_command(args, data_id, experiment):
     command = [
         sys.executable, "-u", "-m", "main.rl.train",
@@ -130,21 +150,34 @@ def build_command(args, data_id, experiment):
         "experiment=" + hydra_string(experiment), "task.env.semanticContactEval.enabled=true",
         "test_episodes=" + str(args.test_episodes), "save_rollouts=false",
     ] + args.override
-    if args.new_oakink is not None:
-        new_root = (ROOT / args.new_oakink.expanduser()).resolve()
-        # Hydra merges dictionaries, retaining any other --override asset mappings.
-        # Apply the named option last so it determines this fixed source root.
-        command.append("+task.env.assetPathMap={" + OLD_OAKINK + ":" + hydra_string(new_root) + "}")
+    mappings = {}
+    if args.new_data_root is not None:
+        new_root = (ROOT / args.new_data_root.expanduser()).resolve()
+        for old_root in args.old_data_roots or DEFAULT_OLD_DATA_ROOTS:
+            # Keep source paths lexical: resolving them on another server can
+            # follow unrelated symlinks and no longer match the manifest.
+            mappings[str(Path(old_root).expanduser())] = new_root
+    elif args.new_oakink is not None:
+        mappings[OLD_OAKINK] = (ROOT / args.new_oakink.expanduser()).resolve()
+    if mappings:
+        # Hydra merges dictionaries, retaining other --override asset mappings.
+        entries = [hydra_dict_key(old) + ":" + hydra_string(new) for old, new in mappings.items()]
+        command.append("+task.env.assetPathMap={" + ",".join(entries) + "}")
     return command
 
 
-def load_best_metrics(summary_path, test_episodes):
+def load_complete_summary(summary_path, test_episodes):
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if not isinstance(summary, dict):
         raise ValueError("Expected a JSON object in {}".format(summary_path))
     if (summary.get("status") != "complete" or summary.get("target_episodes") != test_episodes
             or summary.get("completed_episodes") != test_episodes):
         raise ValueError("Incomplete or unexpected episode count in {}".format(summary_path))
+    return summary
+
+
+def load_best_metrics(summary_path, test_episodes):
+    summary = load_complete_summary(summary_path, test_episodes)
     best = summary.get("best_episode")
     if not isinstance(best, dict):
         raise ValueError("Missing best_episode in {}".format(summary_path))
@@ -163,17 +196,34 @@ def load_best_metrics(summary_path, test_episodes):
     return values
 
 
+def load_task_metrics(summary_path, test_episodes):
+    summary = load_complete_summary(summary_path, test_episodes)
+    task = summary.get("task_metrics")
+    # Older summaries and tasks without diff_metrics retain the existing batch behavior.
+    if task is None:
+        return None
+    if (not isinstance(task, dict) or task.get("episodes") != test_episodes
+            or task.get("error_unit") != "cm"):
+        raise ValueError("Invalid task_metrics in {}".format(summary_path))
+    for name in TASK_METRICS:
+        value = task.get(name)
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or value < 0 or (name == "SR" and value > 1)):
+            raise ValueError("Invalid {}={!r} in task_metrics: {}".format(name, value, summary_path))
+    return task
+
+
 def write_xlsx(path, rows):
-    """Write the five-column workbook with stdlib OOXML; no extra Excel dependency."""
+    """Write the nine-column workbook with stdlib OOXML; no extra Excel dependency."""
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     worksheet = ET.Element("worksheet", xmlns=ns)
     columns = ET.SubElement(worksheet, "cols")
-    for index, width in enumerate((32, 24, 32, 42, 34), 1):
+    for index, width in enumerate((32, 24, 32, 42, 34) + (16,) * len(TASK_METRICS), 1):
         ET.SubElement(columns, "col", min=str(index), max=str(index), width=str(width), customWidth="1")
     sheet_data = ET.SubElement(worksheet, "sheetData")
     for row_index, values in enumerate([COLUMNS] + rows, 1):
         row = ET.SubElement(sheet_data, "row", r=str(row_index))
-        for column, value in zip("ABCDE", values):
+        for column, value in zip("ABCDEFGHI", values):
             if value is None:
                 continue
             cell = ET.SubElement(row, "c", r="{}{}".format(column, row_index))
@@ -182,7 +232,7 @@ def write_xlsx(path, rows):
             else:
                 cell.set("t", "inlineStr")
                 ET.SubElement(ET.SubElement(cell, "is"), "t").text = str(value)
-    ET.SubElement(worksheet, "autoFilter", ref="A1:E{}".format(len(rows) + 1))
+    ET.SubElement(worksheet, "autoFilter", ref="A1:I{}".format(len(rows) + 1))
     parts = {
         "[Content_Types].xml": (
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -244,7 +294,7 @@ def main(argv=None):
     token = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
     output = args.output.resolve()
     log_root = (args.logs_dir or output.with_name(output.stem + "_logs")).resolve() / token
-    rows = [[data_id, args.new_obj, None, None, None] for data_id in ids]
+    rows = [[data_id, args.new_obj] + [None] * (len(COLUMNS) - 2) for data_id in ids]
     reports = []
     if not args.dry_run:
         log_root.mkdir(parents=True)
@@ -271,12 +321,19 @@ def main(argv=None):
                 raise ValueError("Expected one summary.json for {}, found {}".format(experiment, len(matches)))
             report["summary"] = str(matches[0])
             values = load_best_metrics(matches[0], args.test_episodes)
-            rows[index][2:] = values
+            task_metrics = load_task_metrics(matches[0], args.test_episodes)
+            task_values = ([task_metrics[name] for name in TASK_METRICS]
+                           if task_metrics is not None else ["NA"] * len(TASK_METRICS))
+            rows[index][2:] = values + task_values
             report.update(status="complete", metrics=dict(zip(METRICS, values)))
             print("Best episode: {}".format(dict(zip(METRICS, values))), flush=True)
+            if task_metrics is not None:
+                print(("[test_task_summary] episodes: {episodes} SR: {SR:.4f} E_t: {E_t:.4f} "
+                       "E_j: {E_j:.4f} E_ft: {E_ft:.4f} error_unit: {error_unit}").format(**task_metrics),
+                      flush=True)
         except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as exc:
             interrupted = isinstance(exc, KeyboardInterrupt)
-            rows[index][2:] = ["ERROR"] * len(METRICS)
+            rows[index][2:] = ["ERROR"] * (len(COLUMNS) - 2)
             report.update(status="interrupted" if interrupted else "error", error=str(exc) or "KeyboardInterrupt")
             print("ERROR {}: {}".format(data_id, report["error"]), file=sys.stderr, flush=True)
         reports.append(report)

@@ -25,6 +25,12 @@ def episode_selection_key(record):
             score("planned_semantic_contact_coverage"), score("black_violation_frame_ratio", True))
 
 
+def format_task_metrics_summary(summary):
+    return (f"episodes: {summary['episodes']} SR: {summary['SR']:.4f} "
+            f"E_t: {summary['E_t']:.4f} E_j: {summary['E_j']:.4f} "
+            f"E_ft: {summary['E_ft']:.4f} error_unit: {summary['error_unit']}")
+
+
 class EpisodeStatistics:
     def __init__(self, limit, output_dir, print_stats=True):
         self.limit = validate_test_episodes(limit)
@@ -39,6 +45,9 @@ class EpisodeStatistics:
         self.semantic_enabled = None
         self.semantic_totals = None
         self.semantic_counts = {}
+        self.task_enabled = None
+        self.task_successes = 0
+        self.task_error_sums = {"E_t": 0.0, "E_j": 0.0, "E_ft": 0.0}
         self._files = ExitStack()
 
     @property
@@ -55,7 +64,7 @@ class EpisodeStatistics:
             raise
         return self
 
-    def add_batch(self, done_ids, rewards, steps, snapshot=None):
+    def add_batch(self, done_ids, rewards, steps, snapshot=None, *, success_buf=None, diff_metrics=None):
         """Accept the first remaining ended environments, ordered by environment ID."""
         ids = done_ids.detach().cpu().flatten().tolist()
         if not ids or len(set(ids)) != len(ids):
@@ -77,7 +86,27 @@ class EpisodeStatistics:
                 self.semantic_totals = SemanticContactSummary()
 
         accepted = sorted(ids)[:self.limit - self.count]
-        for env_id in accepted:
+        task_enabled = diff_metrics is not None
+        if self.task_enabled is not None and self.task_enabled != task_enabled:
+            raise ValueError("Task metric availability changed during the test run")
+        task_values = {}
+        if task_enabled:
+            if success_buf is None or not all(name in diff_metrics for name in
+                                              ("diff_obj_pos", "diff_joints", "diff_ft")):
+                raise ValueError("Task metrics require success_buf and all three terminal errors")
+            fields = {"SR": success_buf, "E_t": diff_metrics["diff_obj_pos"],
+                      "E_j": diff_metrics["diff_joints"], "E_ft": diff_metrics["diff_ft"]}
+            for name, values in fields.items():
+                if values.ndim != 1 or len(values) != len(rewards):
+                    raise ValueError("Task metric fields must have one value per environment")
+                # Validate only accepted episodes; unfinished or excess environments do not count.
+                values = values.detach()[accepted].cpu().tolist()
+                if any(not math.isfinite(value) or value < 0 or (name == "SR" and value not in (0, 1))
+                       for value in values):
+                    raise ValueError("Invalid terminal task metric: " + name)
+                task_values[name] = values
+
+        for task_row, env_id in enumerate(accepted):
             reward, length = float(rewards[env_id].item()), float(steps[env_id].item())
             if not math.isfinite(reward) or not math.isfinite(length):
                 raise ValueError("Episode reward and steps must be finite")
@@ -105,11 +134,24 @@ class EpisodeStatistics:
             self.count += 1
             self.reward_sum += reward
             self.steps_sum += length
+            self.task_enabled = task_enabled
+            if task_enabled:
+                self.task_successes += int(task_values["SR"][task_row])
+                for name in self.task_error_sums:
+                    self.task_error_sums[name] += task_values[name][task_row]
             if self.best is None or episode_selection_key(record) > episode_selection_key(self.best):
                 self.best = record
             if self.print_stats:
                 print(message, flush=True)
         return accepted
+
+    def task_summary(self):
+        if not self.task_enabled or not self.count:
+            return None
+        return {"episodes": self.count, "successes": self.task_successes,
+                "SR": self.task_successes / self.count,
+                **{name: total / self.count for name, total in self.task_error_sums.items()},
+                "error_unit": "cm"}
 
     def semantic_summary(self):
         if not self.semantic_counts:
@@ -148,6 +190,7 @@ class EpisodeStatistics:
                 "selection_order": ["steps:desc", "operation_completion_ratio:desc",
                                     "planned_semantic_contact_coverage:desc", "black_violation_frame_ratio:asc"],
                 "best_episode": self.best, "semantic_contact": self.semantic_summary(),
+                "task_metrics": self.task_summary(),
             }
             with (self.output_dir / "summary.json").open("w", encoding="utf-8") as file:
                 json.dump(summary, file, indent=2, allow_nan=False)
@@ -161,5 +204,7 @@ class EpisodeStatistics:
                     print("[test_semantic_summary] " + format_semantic_contact_summary(summary["semantic_contact"]), flush=True)
                 if self.best is not None:
                     print("[best_steps] " + self.best["log"], flush=True)
+                if summary["task_metrics"] is not None:
+                    print("[test_task_summary] " + format_task_metrics_summary(summary["task_metrics"]), flush=True)
         finally:
             self._files.close()

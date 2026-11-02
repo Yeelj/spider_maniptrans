@@ -23,7 +23,7 @@ def read_workbook(path):
         sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
     rows = []
     for row in sheet.findall("s:sheetData/s:row", namespace):
-        values = [None] * 5
+        values = [None] * len(batch.COLUMNS)
         for cell in row:
             column = ord(cell.get("r")[0]) - ord("A")
             if cell.get("t") == "inlineStr":
@@ -44,6 +44,7 @@ class BatchEvaluationTests(unittest.TestCase):
         self.output = self.root / "results.xlsx"
         self.argv = ["--ids-file", str(self.ids), "--checkpoint", "policy.pth",
                      "--new-obj", "045", "--reference-dataset", "TACO", "--output", str(self.output)]
+        self.task_values = [.5, 1.23456789, .75, 2.]
 
     def summary(self, **changes):
         result = {"status": "complete", "target_episodes": 120, "completed_episodes": 120,
@@ -53,7 +54,7 @@ class BatchEvaluationTests(unittest.TestCase):
         path.write_text(json.dumps(result), encoding="utf-8")
         return path
 
-    def fake_project(self):
+    def fake_project(self, task_metrics=True):
         package = self.root / "main" / "rl"
         package.mkdir(parents=True)
         (package.parent / "__init__.py").touch()
@@ -87,8 +88,18 @@ class BatchEvaluationTests(unittest.TestCase):
                     "black_violation_frame_ratio": .99,
                 },
             }
+            if WITH_TASK_METRICS:
+                summary["task_metrics"] = {
+                    "episodes": count, "successes": count // 2, "SR": .5,
+                    "E_t": 1.23456789, "E_j": .75, "E_ft": 2., "error_unit": "cm",
+                }
+                if data_id == "different":
+                    summary["task_metrics"].update(successes=0, SR=0., E_t=10.25, E_j=20.5, E_ft=30.75)
+                print(("[test_task_summary] episodes: {episodes} SR: {SR:.4f} E_t: {E_t:.4f} "
+                       "E_j: {E_j:.4f} E_ft: {E_ft:.4f} error_unit: {error_unit}").format(
+                           **summary["task_metrics"]), flush=True)
             (directory / "summary.json").write_text(json.dumps(summary))
-        '''), encoding="utf-8")
+        ''').replace("WITH_TASK_METRICS", repr(task_metrics)), encoding="utf-8")
         for path in ("policy.pth", "assets/imitator_rh_artimano.pth", "assets/imitator_lh_artimano.pth"):
             checkpoint = self.root / path
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +140,54 @@ class BatchEvaluationTests(unittest.TestCase):
     def test_best_metrics_keep_precision_and_na(self):
         self.assertEqual(batch.load_best_metrics(self.summary(), 120), [.123456789, .75, "NA"])
 
+    def test_task_metrics_keep_precision_and_validate_episode_count_and_units(self):
+        metrics = dict(episodes=120, successes=60, SR=.5, E_t=1.23456789, E_j=.75, E_ft=2., error_unit="cm")
+        self.assertEqual(batch.load_task_metrics(self.summary(task_metrics=metrics), 120), metrics)
+        self.assertIsNone(batch.load_task_metrics(self.summary(), 120))
+        self.assertIsNone(batch.load_task_metrics(self.summary(task_metrics=None), 120))
+        for changes in ({"episodes": 119}, {"error_unit": "m"}, {"E_t": None}, {"E_j": -1.},
+                        {"E_ft": float("nan")}, {"SR": 1.1}, {"SR": True}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                batch.load_task_metrics(self.summary(task_metrics=dict(metrics, **changes)), 120)
+
+    def test_task_metrics_are_printed_and_exported_per_id_without_changing_semantic_report(self):
+        self.fake_project()
+        output = StringIO()
+        with patch.object(batch, "ROOT", self.root), redirect_stdout(output):
+            self.assertEqual(batch.main(self.argv), 0)
+        expected = ("[test_task_summary] episodes: 120 SR: 0.5000 E_t: 1.2346 "
+                    "E_j: 0.7500 E_ft: 2.0000 error_unit: cm")
+        self.assertEqual(output.getvalue().splitlines().count(expected), 2)
+        self.assertEqual(batch.COLUMNS, ("dataIndices", "new_obj", "operation_completion_ratio",
+                                         "planned_semantic_contact_coverage", "black_violation_frame_ratio",
+                                         "SR", "E_t", "E_j", "E_ft"))
+        self.assertEqual(read_workbook(self.output), [list(batch.COLUMNS),
+                         ["first", "045", .123456789, .75, "NA"] + self.task_values,
+                         ["second", "045", .123456789, .75, "NA"] + self.task_values])
+        report_path, = (self.root / "results_logs").glob("*/batch_report.json")
+        for row in json.loads(report_path.read_text()):
+            self.assertEqual(row["metrics"], dict(zip(batch.METRICS, (.123456789, .75, "NA"))))
+            self.assertEqual(Path(row["process_log"]).read_text().splitlines().count(expected), 1)
+            summary = json.loads(Path(row["summary"]).read_text())
+            self.assertEqual(summary["task_metrics"]["E_t"], 1.23456789)
+
+    def test_older_summaries_without_task_metrics_still_export_normally(self):
+        self.fake_project(task_metrics=False)
+        output = StringIO()
+        with patch.object(batch, "ROOT", self.root), redirect_stdout(output):
+            self.assertEqual(batch.main(self.argv), 0)
+        self.assertNotIn("[test_task_summary]", output.getvalue())
+        self.assertEqual(read_workbook(self.output)[1], ["first", "045", .123456789, .75, "NA"] + ["NA"] * 4)
+
+    def test_each_id_exports_its_own_task_metrics_including_zero_success_rate(self):
+        self.fake_project()
+        self.ids.write_text("different\nfirst\n", encoding="utf-8")
+        with patch.object(batch, "ROOT", self.root), redirect_stdout(StringIO()):
+            self.assertEqual(batch.main(self.argv), 0)
+        self.assertEqual(read_workbook(self.output)[1:], [
+            ["different", "045", .123456789, .75, "NA", 0., 10.25, 20.5, 30.75],
+            ["first", "045", .123456789, .75, "NA"] + self.task_values])
+
     def test_incomplete_or_missing_semantic_data_is_rejected(self):
         for change in ({"status": "incomplete"}, {"completed_episodes": 119}, {"target_episodes": 100},
                        {"best_episode": None}, {"best_episode": {}}):
@@ -145,11 +204,18 @@ class BatchEvaluationTests(unittest.TestCase):
                 batch.load_best_metrics(path, 120)
 
     def test_xlsx_keeps_text_ids_numbers_na_and_escapes_xml(self):
-        rows = [["=sequence<&", "045", .123456789, "NA", 0.0]]
+        rows = [["=sequence<&", "045", .123456789, "NA", 0.0] + self.task_values]
         batch.write_xlsx(self.output, rows)
         self.assertEqual(read_workbook(self.output), [list(batch.COLUMNS)] + rows)
-        batch.write_xlsx(self.output, [["updated", "045", 1, 0, 0]])
-        self.assertEqual(read_workbook(self.output)[1], ["updated", "045", 1, 0, 0])
+        namespace = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        with ZipFile(str(self.output)) as archive:
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+        self.assertEqual(sheet.find("s:autoFilter", namespace).get("ref"), "A1:I2")
+        self.assertEqual(len(sheet.findall("s:cols/s:col", namespace)), 9)
+        self.assertTrue(all("t" not in sheet.find("s:sheetData/s:row/s:c[@r='{}2']".format(column), namespace).attrib
+                            for column in "FGHI"))
+        batch.write_xlsx(self.output, [["updated", "045", 1, 0, 0, 0, 0, 0, 0]])
+        self.assertEqual(read_workbook(self.output)[1], ["updated", "045", 1, 0, 0, 0, 0, 0, 0])
 
     def test_real_subprocesses_continue_after_failure_and_use_best_episode(self):
         self.fake_project()
@@ -158,9 +224,9 @@ class BatchEvaluationTests(unittest.TestCase):
             code = batch.main(self.argv)
         self.assertEqual(code, 1)
         self.assertEqual(read_workbook(self.output), [list(batch.COLUMNS),
-                         ["second", "045", .123456789, .75, "NA"],
-                         ["failed", "045", "ERROR", "ERROR", "ERROR"],
-                         ["first", "045", .123456789, .75, "NA"]])
+                         ["second", "045", .123456789, .75, "NA"] + self.task_values,
+                         ["failed", "045"] + ["ERROR"] * 7,
+                         ["first", "045", .123456789, .75, "NA"] + self.task_values])
         report_path, = (self.root / "results_logs").glob("*/batch_report.json")
         report = json.loads(report_path.read_text())
         self.assertEqual([row["dataIndices"] for row in report], ["second", "failed", "first"])
@@ -180,8 +246,8 @@ class BatchEvaluationTests(unittest.TestCase):
         with patch.object(batch, "ROOT", self.root), redirect_stdout(StringIO()):
             self.assertEqual(batch.main(argv), 0)
         self.assertEqual(read_workbook(self.output), [list(batch.COLUMNS),
-                         ["9b728@0", "spoon@1", .123456789, .75, "NA"],
-                         ["1b46d@1", "spoon@1", .123456789, .75, "NA"]])
+                         ["9b728@0", "spoon@1", .123456789, .75, "NA"] + self.task_values,
+                         ["1b46d@1", "spoon@1", .123456789, .75, "NA"] + self.task_values])
         commands = list((self.root / "dumps").glob("*/command.json"))
         self.assertEqual(len(commands), 2)
         expected_map = "+task.env.assetPathMap={" + batch.OLD_OAKINK + ":" + json.dumps(
@@ -198,6 +264,49 @@ class BatchEvaluationTests(unittest.TestCase):
         self.assertIn(batch.OLD_OAKINK, output.getvalue())
         self.assertIn(str(destination), output.getvalue())
         self.assertFalse(self.output.exists())
+
+    def test_shared_data_root_migration_runs_both_datasets_and_exports_best_episodes(self):
+        self.fake_project()
+        destination = self.root / "copied assets" / "data"
+        for dataset, data_id, new_obj in (("TACO", "sk_box_1104218", "045"),
+                                          ("OakInk-v2", "9b728@0", "spoon@1")):
+            with self.subTest(dataset=dataset):
+                self.ids.write_text(data_id + "\n", encoding="utf-8")
+                argv = list(self.argv)
+                argv[argv.index("--reference-dataset") + 1] = dataset
+                argv[argv.index("--new-obj") + 1] = new_obj
+                with patch.object(batch, "ROOT", self.root), redirect_stdout(StringIO()):
+                    self.assertEqual(batch.main(argv + ["--new-data-root", str(destination)]), 0)
+                self.assertEqual(read_workbook(self.output)[1],
+                                 [data_id, new_obj, .123456789, .75, "NA"] + self.task_values)
+        for path in (self.root / "dumps").glob("*/command.json"):
+            command = json.loads(path.read_text())
+            mapping = command[-1]
+            for old_root in batch.DEFAULT_OLD_DATA_ROOTS:
+                self.assertIn(old_root + ":" + json.dumps(str(destination)), mapping)
+
+    def test_custom_old_data_roots_replace_defaults_and_reach_subprocess(self):
+        self.fake_project()
+        old_roots = ["/old server/data", "/old,archive/data"]
+        argv = self.argv + ["--new-data", "data"]
+        for old_root in old_roots:
+            argv += ["--old-data-root", old_root]
+        with patch.object(batch, "ROOT", self.root), redirect_stdout(StringIO()):
+            self.assertEqual(batch.main(argv), 0)
+        for path in (self.root / "dumps").glob("*/command.json"):
+            mapping = json.loads(path.read_text())[-1]
+            self.assertIn("/old\\ server/data", mapping)
+            self.assertIn("/old\\,archive/data", mapping)
+            self.assertIn(json.dumps(str(self.root / "data")), mapping)
+            for old_root in batch.DEFAULT_OLD_DATA_ROOTS:
+                self.assertNotIn(old_root, mapping)
+
+    def test_ambiguous_or_relative_source_mapping_options_are_rejected(self):
+        for options in (["--old-data-root", "/old/data"],
+                        ["--old-data-root", "relative/data", "--new-data-root", "/new/data"],
+                        ["--new-data-root", "/new/data", "--new-oakink", "/new/data/OakInk-v2"]):
+            with self.subTest(options=options), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                batch.parse_args(self.argv + options)
 
     def test_successful_repeat_runs_have_isolated_logs(self):
         self.fake_project()
@@ -222,7 +331,7 @@ class BatchEvaluationTests(unittest.TestCase):
                 self.assertEqual(batch.main(self.argv), 130)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(read_workbook(self.output)[1:], [
-            ["first", "045", "ERROR", "ERROR", "ERROR"], ["second", "045", None, None, None]])
+            ["first", "045"] + ["ERROR"] * 7, ["second", "045"] + [None] * 7])
 
 
 if __name__ == "__main__":
