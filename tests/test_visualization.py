@@ -114,15 +114,17 @@ class VisualizationConfigTests(unittest.TestCase):
         for name in ("rightHandColor", "leftHandColor", "objectColor", "toolColor"):
             for value in ([0, 1], [0, 0, 0, 1], "red", [0, 1, -0.1], [1.1, 0, 0],
                           [0, float("nan"), 0], [0, float("inf"), 0], [True, 0, 0], ["1", 0, 0]):
-                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
-                    VisualizationConfig.from_mapping({name: value})
+                for values in ({name: value}, OmegaConf.create({name: value})):
+                    with self.subTest(name=name, value=value, container=type(values).__name__), self.assertRaises(ValueError):
+                        VisualizationConfig.from_mapping(values)
 
     def test_rgb_is_copied_without_mutating_config(self):
-        rgb = [0, 0.5, 1]
-        config = VisualizationConfig.from_mapping({"rightHandColor": rgb, "leftHandColor": [1, 0, 0]})
-        rgb[0] = 1
-        self.assertEqual(config.hand_color("rh"), (0.0, 0.5, 1.0))
-        self.assertEqual(config.hand_color("lh"), (1.0, 0.0, 0.0))
+        for rgb in ([0, 0.5, 1], OmegaConf.create([0, 0.5, 1])):
+            with self.subTest(rgb_container=type(rgb).__name__):
+                config = VisualizationConfig.from_mapping({"rightHandColor": rgb, "leftHandColor": [1, 0, 0]})
+                rgb[0] = 1
+                self.assertEqual(config.hand_color("rh"), (0.0, 0.5, 1.0))
+                self.assertEqual(config.hand_color("lh"), (1.0, 0.0, 0.0))
 
     def test_hydra_accepts_test_command_overrides_without_plus(self):
         with initialize_config_dir(config_dir=str(ROOT / "main/cfg"), version_base="1.1"):
@@ -135,10 +137,18 @@ class VisualizationConfigTests(unittest.TestCase):
                 "task.env.visualization.showReferenceSkeleton=false",
                 "task.env.visualization.showContactHighlight=false",
             ])
-            config = VisualizationConfig.from_mapping(OmegaConf.to_container(cfg.task.env.visualization))
-            self.assertFalse(config.show_reference_skeleton)
-            self.assertFalse(config.show_contact_highlight)
-            self.assertEqual(config.tool_color, (1.0, 0.45, 0.08))
+            # Runtime mapping conversion preserves the ListConfig RGB values.
+            for values in (cfg.task.env.visualization, dict(cfg.task.env.visualization),
+                           OmegaConf.to_container(cfg.task.env.visualization)):
+                with self.subTest(container=type(values).__name__,
+                                  rgb_container=type(values["rightHandColor"]).__name__):
+                    config = VisualizationConfig.from_mapping(values)
+                    self.assertFalse(config.show_reference_skeleton)
+                    self.assertFalse(config.show_contact_highlight)
+                    self.assertEqual(config.right_hand_color, (0.35, 0.75, 0.95))
+                    self.assertEqual(config.left_hand_color, (0.75, 0.45, 0.95))
+                    self.assertEqual(config.object_color, (0.2, 0.7, 0.35))
+                    self.assertEqual(config.tool_color, (1.0, 0.45, 0.08))
             self.assertFalse(cfg.task.env.training)
             self.assertFalse(cfg.task.task.randomize)
 

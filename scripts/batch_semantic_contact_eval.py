@@ -4,10 +4,10 @@
 '''
 python scripts/batch_semantic_contact_eval.py \
   --ids-file ids.txt \
-  --checkpoint runs/SPIDER_Taco_sk_box_1104218_045_artimano__10-23-10-13-30/nn/last_SPIDER_Taco_sk_box_1104218_045_artimano_ep_10000_rew__141.53_.pth \
+  --checkpoint runs/ \
   --new-obj 045 \
   --reference-dataset TACO \
-  --output add_data_evaluation/results.xlsx
+  --output add_data_evaluation/
 '''
 
 import argparse

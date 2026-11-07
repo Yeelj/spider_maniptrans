@@ -5,6 +5,8 @@ import math
 from numbers import Real
 from typing import Mapping, Optional, Tuple
 
+from omegaconf import ListConfig
+
 
 Color = Optional[Tuple[float, float, float]]
 
@@ -46,7 +48,7 @@ class VisualizationConfig:
             value = values[name]
             if name.endswith("Color"):
                 if value is not None:
-                    if not isinstance(value, (list, tuple)) or len(value) != 3 or any(
+                    if not isinstance(value, (list, tuple, ListConfig)) or len(value) != 3 or any(
                         isinstance(channel, bool) or not isinstance(channel, Real)
                         or not math.isfinite(channel) or not 0.0 <= channel <= 1.0
                         for channel in value
